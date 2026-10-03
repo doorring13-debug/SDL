@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Staff | Scratch Demon List</title>
+    <link rel="icon" type="image/png" href="/assets/icon.png">
+    <link rel="stylesheet" href="/style.css">
+    <style>
+
+        body.embed-mode #global-nav {
+            display: none !important;
+        }
+
+        html.embed-mode,
+        body.embed-mode {
+            min-height: 100%;
+            height: 100%;
+            overflow: hidden;
+            overscroll-behavior: contain;
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+
+        body.embed-mode {
+            display: flex;
+            flex-direction: column;
+        }
+
+        html.embed-mode::-webkit-scrollbar,
+        body.embed-mode::-webkit-scrollbar,
+        body.embed-mode *::-webkit-scrollbar {
+            display: none;
+            width: 0;
+            height: 0;
+        }
+
+        body.embed-mode footer,
+        body.embed-mode .site-footer,
+        body.embed-mode #global-footer {
+            display: none !important;
+        }
+
+
+        body.embed-mode .page-content {
+            max-width: none;
+            width: 100%;
+            margin: 0;
+            padding: 0 0 20px;
+            min-height: 0;
+            height: 100%;
+            flex: 1 1 auto;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            box-sizing: border-box;
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+
+        body.embed-mode .page-content::-webkit-scrollbar {
+            display: none;
+            width: 0;
+            height: 0;
+        }
+
+        body.embed-mode .page-content h1 {
+            display: none;
+        }
+
+        body.embed-mode .staff-section {
+            margin-bottom: 24px;
+        }
+
+        body.embed-mode .staff-section h2 {
+            font-size: 0.95em;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+        }
+
+        body.embed-mode .staff-flex {
+            flex-direction: column;
+            flex-wrap: nowrap;
+            gap: 10px;
+        }
+
+        body.embed-mode .staff-card {
+            width: 100%;
+            padding: 10px 14px;
+        }
+
+        body.embed-mode #staff-container {
+            padding-bottom: 20px;
+            box-sizing: border-box;
+        }
+
+        .page-content {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 60px 20px;
+        }
+
+        .page-content h1 {
+            text-align: center;
+            color: var(--text);
+            font-size: 2.6em;
+            margin-bottom: 50px;
+        }
+
+        .staff-section {
+            margin-bottom: 40px;
+        }
+
+        .staff-section h2 {
+            font-size: 1.05em;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            margin-bottom: 20px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .rank-owner { color: #00e676; }
+        .rank-admin { color: #4dc4ff; }
+        .rank-moderator { color: var(--danger); }
+
+        .staff-flex {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .staff-card {
+            background: var(--surface);
+            padding: 12px 20px;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border);
+            width: fit-content;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            transition: border-color 0.15s, background 0.15s;
+        }
+
+        .staff-card:hover {
+            background: var(--surface-2);
+            border-color: #3a414a;
+        }
+
+        .staff-badge {
+            width: 22px;
+            height: 22px;
+            object-fit: contain;
+            flex-shrink: 0;
+        }
+
+        .staff-card a {
+            color: var(--text);
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 1em;
+            white-space: nowrap;
+        }
+
+        .staff-card a:hover {
+            color: var(--accent);
+        }
+
+        @media (max-width: 600px) {
+            .page-content h1 { font-size: 2.1em; margin-bottom: 35px; }
+            .staff-flex { justify-content: center; }
+            .staff-card { width: 100%; justify-content: center; }
+        }
+    </style>
+</head>
+<body>
+    <div id="global-nav"></div>
+
+    <main class="page-content">
+        <h1>Scratch Demon List Staff</h1>
+
+        <div id="staff-container"></div>
+    </main>
+
+    <script>
+        (function () {
+            const params = new URLSearchParams(window.location.search);
+            const embed = params.get('embed') === '1' || params.get('nonav') === '1';
+
+            if (!embed) {
+                const script = document.createElement('script');
+                script.src = '/nav.js';
+                document.head.appendChild(script);
+            }
+        })();
+    </script>
+    <script>
+        const isImpossibleList = window.location.hostname.includes('impossible');
+
+        const embedParams = new URLSearchParams(window.location.search);
+        const isEmbedMode = embedParams.get('embed') === '1' || embedParams.get('nonav') === '1';
+
+        if (isEmbedMode) {
+            document.documentElement.classList.add('embed-mode');
+            document.body.classList.add('embed-mode');
+        }
+
+
+        function redirectEmbedLinksToParent() {
+            if (!isEmbedMode || window.parent === window) return;
+
+            document.addEventListener('click', (event) => {
+                const link = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+                if (!link) return;
+
+                const href = link.getAttribute('href') || '';
+                if (!href || href.startsWith('#') || href.toLowerCase().startsWith('javascript:')) return;
+
+                event.preventDefault();
+
+                if ((link.getAttribute('target') || '').toLowerCase() === '_blank') {
+                    window.open(link.href, '_blank', 'noopener');
+                    return;
+                }
+
+                window.parent.location.href = link.href;
+            }, true);
+        }
+
+        redirectEmbedLinksToParent();
+
+
+        function containEmbedScrollBoundaries() {
+            if (!isEmbedMode) return;
+
+            const getScrollElement = () => document.querySelector('.page-content') || document.scrollingElement || document.documentElement || document.body;
+
+            function isAtTop(el) {
+                return el.scrollTop <= 0;
+            }
+
+            function isAtBottom(el) {
+                return Math.ceil(el.scrollTop + el.clientHeight) >= el.scrollHeight;
+            }
+
+            window.addEventListener('wheel', (event) => {
+                const scroller = getScrollElement();
+                const canScroll = scroller.scrollHeight > scroller.clientHeight + 1;
+
+                if (!canScroll) return;
+
+                if ((event.deltaY < 0 && isAtTop(scroller)) || (event.deltaY > 0 && isAtBottom(scroller))) {
+                    event.preventDefault();
+                }
+            }, { passive: false });
+
+            let lastTouchY = 0;
+
+            window.addEventListener('touchstart', (event) => {
+                if (event.touches && event.touches.length) {
+                    lastTouchY = event.touches[0].clientY;
+                }
+            }, { passive: true });
+
+            window.addEventListener('touchmove', (event) => {
+                if (!event.touches || !event.touches.length) return;
+
+                const currentY = event.touches[0].clientY;
+                const deltaY = lastTouchY - currentY;
+                lastTouchY = currentY;
+
+                const scroller = getScrollElement();
+                const canScroll = scroller.scrollHeight > scroller.clientHeight + 1;
+
+                if (!canScroll) return;
+
+                if ((deltaY < 0 && isAtTop(scroller)) || (deltaY > 0 && isAtBottom(scroller))) {
+                    event.preventDefault();
+                }
+            }, { passive: false });
+        }
+
+        containEmbedScrollBoundaries();
+
+
+        if (isImpossibleList) {
+            document.body.classList.add('impossible-list');
+        }
+
+        function escapeHtml(str) {
+            return String(str ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        async function loadStaff() {
+            try {
+                const res = await fetch('/api/staff');
+                const data = await res.json();
+                const container = document.getElementById('staff-container');
+
+                const sections = [
+                    { title: 'Owner', key: 'owners', class: 'rank-owner', badge: 'assets/owner.png' },
+                    { title: 'Admins', key: 'admins', class: 'rank-admin', badge: 'assets/eldermoderator.png' },
+                    { title: 'Moderators', key: 'moderators', class: 'rank-moderator', badge: 'assets/moderator.png' }
+                ];
+
+                container.innerHTML = sections.map(section => {
+                    const members = data[section.key];
+                    if (!members || members.length === 0) return ''; 
+
+                    return `
+                        <div class="staff-section">
+                            <h2 class="${section.class}">${section.title}</h2>
+                            <div class="staff-flex">
+                                ${members.map(m => {
+                                    const displayName = String(m.displayName || m.username || '').trim();
+                                    const username = String(m.username || '').trim();
+
+                                    return `
+                                        <div class="staff-card">
+                                            <img src="/${section.badge}" class="staff-badge" alt="Badge">
+                                            <a href="/profile?user=${encodeURIComponent(username)}">${escapeHtml(displayName)}</a>
+                                        </div>
+                                    `;
+                                }).join('')}
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            } catch (err) {
+                console.error("Failed to load staff profiles:", err);
+            }
+        }
+
+        loadStaff();
+    </script>
+</body>
+</html>

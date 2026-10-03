@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Verify Account | Scratch Demon List</title>
+    <link rel="icon" type="image/png" href="/assets/icon.png">
+    <link rel="stylesheet" href="/style.css">
+    <style>
+        .auth-wrapper { flex-grow: 1; display: flex; justify-content: center; align-items: center; padding: 60px 20px; }
+        .auth-box {
+            background: var(--surface); padding: 2.6rem; border-radius: var(--radius);
+            border: 1px solid var(--border); width: 100%; max-width: 420px; text-align: center;
+        }
+        .status-dot {
+            width: 12px; height: 12px; border-radius: 50%;
+            margin: 0 auto 1.4rem; background: var(--text-muted);
+        }
+        .status-dot.success { background: var(--accent); }
+        .status-dot.error { background: var(--danger); }
+        h2 { margin: 10px 0; color: var(--text); font-size: 1.6em; }
+        h2.success { color: var(--accent); }
+        h2.error { color: var(--danger); }
+        p { color: var(--text-muted); line-height: 1.5; }
+        .btn {
+            display: none; margin-top: 22px; padding: 12px 26px;
+            background: var(--accent); color: #000; font-weight: 700;
+            text-decoration: none; border-radius: var(--radius-sm);
+        }
+        .btn:hover { background: var(--accent-hover); }
+    </style>
+</head>
+<body>
+    <div id="global-nav"></div>
+    <main class="auth-wrapper">
+        <div class="auth-box" id="status-box">
+            <div class="status-dot" id="icon"></div>
+            <h2 id="title">Verifying...</h2>
+            <p id="message">Please wait while we activate your account.</p>
+            <a href="/login" class="btn" id="login-btn">Go to Login</a>
+        </div>
+    </main>
+
+    <script src="/nav.js"></script>
+    <script>
+        async function readResponse(response) {
+            const contentType = response.headers.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+                return response.json().catch(() => ({}));
+            }
+            const text = await response.text();
+            return { message: text, error: text };
+        }
+
+        async function verifyAccount() {
+            const params = new URLSearchParams(window.location.search);
+            const token = params.get('token');
+            const requestedType = params.get('type');
+            const icon = document.getElementById('icon');
+            const title = document.getElementById('title');
+            const message = document.getElementById('message');
+            const btn = document.getElementById('login-btn');
+
+            if (requestedType === 'email-change') {
+                title.innerText = "Verifying Email...";
+                message.innerText = "Please wait while we confirm your new email address.";
+            }
+
+            if (!token) {
+                icon.className = "status-dot error";
+                title.className = "error";
+                title.innerText = "Verification Failed";
+                message.innerText = "Missing auth token...";
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/verify?token=${encodeURIComponent(token)}`);
+                const data = await readResponse(response);
+
+                if (!response.ok) {
+                    throw new Error(data.error || data.message || "Verification failed.");
+                }
+
+                const verificationType = data.verificationType || requestedType || 'account';
+                icon.className = "status-dot success";
+                title.className = "success";
+                btn.style.display = "inline-block";
+
+                if (verificationType === 'email-change') {
+                    title.innerText = "Email Updated!";
+                    message.innerText = data.message || "Your new email address has been verified.";
+                    btn.href = "/account-settings";
+                    btn.innerText = "Back to Settings";
+                } else {
+                    title.innerText = "Account Verified!";
+                    message.innerText = data.message || "Your account is now active. You may now log in.";
+                    btn.href = "/login";
+                    btn.innerText = "Go to Login";
+                }
+            } catch (err) {
+                icon.className = "status-dot error";
+                title.className = "error";
+                title.innerText = "Verification Failed";
+                message.innerText = err.message;
+            }
+        }
+
+        window.onload = verifyAccount;
+    </script>
+</body>
+</html>

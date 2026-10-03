@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>About | Scratch Demon List</title>
+    <link rel="icon" type="image/png" href="/assets/icon.png">
+    <link rel="stylesheet" href="/style.css">
+    <style>
+        .page-content {
+            max-width: 920px;
+            margin: 0 auto;
+            padding: 60px 20px;
+            line-height: 1.7;
+            color: var(--text-muted);
+        }
+
+        .page-content h1 {
+            font-size: 2.6em;
+            color: var(--text);
+            text-align: center;
+            margin-bottom: 50px;
+        }
+
+        .about-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 22px;
+            margin-bottom: 22px;
+        }
+
+        .about-card,
+        .full-width-card {
+            background: var(--surface);
+            padding: 34px;
+            border-radius: var(--radius);
+            border: 1px solid var(--border);
+            margin-bottom: 22px;
+        }
+
+        .about-card { margin-bottom: 0; }
+
+        .about-card h2,
+        .full-width-card h2 {
+            color: var(--accent);
+            margin-top: 0;
+            font-size: 1.35em;
+            margin-bottom: 18px;
+        }
+
+        .about-card p,
+        .full-width-card p {
+            margin-bottom: 12px;
+        }
+
+        .highlight {
+            color: var(--text);
+            font-weight: 600;
+        }
+
+        .stat-box {
+            display: flex;
+            justify-content: space-around;
+            text-align: center;
+            margin-top: 28px;
+            background: var(--bg);
+            padding: 32px 20px;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border);
+        }
+
+        .stat-item .stat-num {
+            display: block;
+            font-family: var(--font-display);
+            font-size: 2em;
+            font-weight: 700;
+            color: var(--accent);
+            line-height: 1.2;
+            margin-bottom: 8px;
+        }
+
+        .stat-item span:not(.stat-num) {
+            font-size: 0.8em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-muted);
+        }
+
+        @media (max-width: 800px) {
+            .about-grid { grid-template-columns: 1fr; gap: 22px; }
+            .page-content h1 { font-size: 2.1em; margin-bottom: 35px; }
+            .stat-box { flex-direction: column; gap: 25px; padding: 25px 20px; }
+        }
+    </style>
+</head>
+<body>
+    <div id="global-nav"></div>
+
+    <main class="page-content">
+        <h1>About the List</h1>
+
+        <section class="full-width-card">
+            <h2>What is the Scratch Demon List?</h2>
+            <p>
+                The <span class="highlight">Scratch Demon List (SDL)</span> is a community ranking of challenging Geometry Dash levels. The goal is to provide a simple place to submit, verify, and rank difficult levels.
+            </p>
+        </section>
+
+        <div class="about-grid">
+            <div class="about-card">
+                <h2>The Ranking System</h2>
+                <p>
+                    Levels are ranked based on their <span class="highlight">estimated difficulty</span>. We review every placement and ensure that the list is accurate, even if that may take some adjustments along the way.
+                </p>
+                <p>
+                    Beating levels will award you with <span class="b">List Points</span>, these are calculated using a similar system as the <span class="b">Pointercrate Demonlist</span>. The harder the level, the more points. Try to reach the top of the <span class="b">Leaderboard</span>!
+                </p>
+            </div>
+            <div class="about-card">
+                <h2>About the game</h2>
+                <p>
+                    The Scratch Demon List is an independent community project and is not affiliated with <span class="b">RobTop Games</span>.
+                </p>
+                <p>
+                    Our version introduces the ability to <span class="b">load custom levels via ID</span> as well as a few extra objects and QOL features, such as <span class="b">StartPos switcher</span>.
+                </p>
+            </div>
+        </div>
+
+        <section class="full-width-card" style="text-align: center;">
+            <h2>Statistics</h2>
+            <div class="stat-box">
+                <div class="stat-item">
+                    <span class="stat-num" id="count-levels">--</span>
+                    <span>Demons</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-num" id="count-records">--</span>
+                    <span>Records</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-num" id="count-players">--</span>
+                    <span>Active Players</span>
+                </div>
+            </div>
+        </section>
+
+        <p style="text-align: center; color: #555; margin-top: 50px; font-size: 0.9em; letter-spacing: 0.5px;">
+            © 2026 • Created by Lasokar
+        </p>
+    </main>
+
+    <script src="/nav.js"></script>
+    <script>
+        const isImpossibleList = window.location.hostname.includes('impossible');
+
+        if (isImpossibleList) {
+            document.body.classList.add('impossible-list');
+        }
+
+        async function loadStats() {
+            try {
+                const res = await fetch('/api/globalstats');
+                const stats = await res.json();
+
+                document.getElementById('count-levels').innerText = stats.demons;
+                document.getElementById('count-records').innerText = stats.records;
+                document.getElementById('count-players').innerText = stats.players;
+
+            } catch (e) {
+                console.error("Stats fetch failed", e);
+            }
+        }
+        loadStats();
+    </script>
+</body>
+</html>

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Register | Scratch Demon List</title>
+    <link rel="icon" type="image/png" href="/assets/icon.png">
+    <link rel="stylesheet" href="/style.css">
+    <script src="https://www.google.com/recaptcha/api.js" async defer></script>
+    <style>
+        .auth-wrapper {
+            flex-grow: 1;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            padding: 90px 20px;
+        }
+
+        .auth-box {
+            background: var(--surface);
+            padding: 2.4rem;
+            border-radius: var(--radius);
+            border: 1px solid var(--border);
+            width: 100%;
+            max-width: 440px;
+            height: fit-content;
+        }
+        button {
+            width: 100%;
+            padding: 13px;
+            background: var(--accent);
+            border: none;
+            color: #000;
+            font-family: var(--font-body);
+            font-weight: 700;
+            cursor: pointer;
+            margin-top: 12px;
+            border-radius: var(--radius-sm);
+            transition: background-color 0.15s;
+        }
+        button:hover:not(:disabled) { background: var(--accent-hover); }
+        button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+        h2 { margin: 0 0 20px; text-align: center; color: var(--text); font-size: 1.7em; }
+        #auth-message { text-align: center; margin-bottom: 12px; font-size: 0.9em; min-height: 1.2em; font-weight: 600; }
+        input { width: 100%; padding: 12px 14px; margin: 8px 0; background: var(--bg); border: 1px solid var(--border); color: var(--text); box-sizing: border-box; border-radius: var(--radius-sm); font-size: 0.95em; transition: border-color 0.15s; }
+        input:focus { outline: none; border-color: var(--accent); }
+        .g-recaptcha { margin-top: 14px; }
+        .secondary-link { display: block; text-align: center; color: var(--text-muted); text-decoration: none; margin-top: 18px; font-size: 0.9em; }
+        .secondary-link:hover { color: var(--accent); }
+    </style>
+</head>
+<body>
+    <div id="global-nav"></div>
+    <main class="auth-wrapper">
+        <div class="auth-box">
+            <h2>Create Account</h2>
+            <div id="auth-message"></div>
+            
+            <input type="text" id="username" placeholder="Username" 
+                   maxlength="20" minlength="3" pattern="[a-zA-Z0-9._-]+">
+
+            <input type="email" id="email" placeholder="Email Address" required>
+            
+            <input type="password" id="password" placeholder="Password (min 6 chars)" minlength="6">
+            
+            <input type="password" id="confirm-password" placeholder="Confirm Password">
+
+            <div class="g-recaptcha" data-sitekey="6Lfr1r8sAAAAAFwVFCe-hWK0G4tDlju6Ai5whxEv" data-theme="dark"></div>
+            <button onclick="handleRegister()">Register</button>
+            <a href="/login" class="secondary-link">Already have an account? Login</a>
+        </div>
+    </main>
+
+    <script src="/nav.js"></script>
+    <script>
+        const msgDiv = document.getElementById('auth-message');
+
+        function showMessage(text, isError) {
+            msgDiv.innerText = text;
+            msgDiv.style.color = isError ? "#ff4444" : "#ffffff";
+        }
+
+        async function handleRegister() {
+	    const btn = document.querySelector('button');
+            const username = document.getElementById('username').value;
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            const confirmPassword = document.getElementById('confirm-password').value;
+
+            const captchaResponse = grecaptcha.getResponse();
+    if (!captchaResponse) {
+        return showMessage("Please complete the CAPTCHA.", true);
+    }
+    if (!email || !username || !password || !confirmPassword) {
+        return showMessage("Please fill in all fields.", true);
+    }
+    if (!email.includes('@')) {
+        return showMessage("Please enter a valid email address.", true);
+    }
+    if (password !== confirmPassword) {
+        return showMessage("Passwords do not match!", true);
+    }
+    if (password.length < 6) {
+        return showMessage("Password must be at least 6 characters.", true);
+    }
+
+            btn.disabled = true;
+            const originalText = btn.innerText;
+            btn.innerText = "Loading...";
+
+            try {
+                const response = await fetch('/api/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, email, password, captchaToken: captchaResponse })
+                });
+
+                if (response.status === 429) {
+                    msgDiv.innerText = "Rate limited, try again later!";
+                    msgDiv.style.color = "#ff4444";
+                    btn.disabled = false;
+                    btn.innerText = originalText;
+                    return;
+                }
+
+                const data = await response.json();
+                if (response.ok) {
+                    showMessage("Account created! Please check your inbox (and spam folder) to activate it.", false);
+                } else {
+                    showMessage(data.error || "Registration failed.", true);
+		    grecaptcha.reset();
+                }
+            } catch (err) {
+                showMessage("Server error. Please try again later.", true);
+            } finally {
+		setTimeout(() => {
+        	    btn.disabled = false;
+                    btn.innerText = originalText;
+                }, 2000);
+            }
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Guidelines | Scratch Demon List</title>
+    <link rel="icon" type="image/png" href="/assets/icon.png">
+    <link rel="stylesheet" href="/style.css">
+<style>
+    .page-content {
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 60px 20px;
+        color: var(--text-muted);
+        line-height: 1.65;
+    }
+
+    .page-content h1 {
+        font-size: 2.6em;
+        color: var(--text);
+        margin-bottom: 40px;
+        text-align: center;
+    }
+
+    .page-content .section-card {
+        background: var(--surface);
+        border-radius: var(--radius);
+        padding: 34px;
+        margin-bottom: 22px;
+        border: 1px solid var(--border);
+    }
+
+    .page-content h2 {
+        color: var(--accent);
+        margin-top: 0;
+        font-size: 1.5em;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 14px;
+        margin-bottom: 24px;
+    }
+
+    .page-content .rule-list {
+        list-style: none;
+        padding: 0;
+    }
+
+    .page-content .rule-list li {
+        position: relative;
+        padding-left: 26px;
+        margin-bottom: 18px;
+        font-size: 1.02em;
+    }
+
+    .page-content .rule-list li:last-child {
+        margin-bottom: 0;
+    }
+
+    .page-content .rule-list li::before {
+        content: "";
+        position: absolute;
+        left: 4px;
+        top: 0.6em;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--accent);
+    }
+
+    .page-content .note {
+        background: var(--bg);
+        border-left: 3px solid var(--border);
+        padding: 14px 18px;
+        margin: 14px 0;
+        font-size: 0.92em;
+        color: var(--text-muted);
+        border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    }
+
+    .page-content .link-box {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-top: 12px;
+    }
+
+    .page-content .link-box a {
+        color: var(--accent);
+        background: var(--bg);
+        padding: 8px 14px;
+        border-radius: var(--radius-sm);
+        width: fit-content;
+        transition: background 0.15s;
+        border: 1px solid var(--border);
+        font-weight: 600;
+    }
+
+    .page-content .link-box a:hover {
+        background: var(--surface-2);
+        text-decoration: none;
+    }
+
+    .page-content a {
+        color: var(--accent);
+        text-decoration: none;
+        font-weight: 600;
+    }
+
+    .page-content a:hover {
+        text-decoration: underline;
+    }
+
+    .page-content .allowed-options {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+        gap: 10px;
+        margin-top: 15px;
+    }
+
+    .page-content .option-tag {
+        background: var(--bg);
+        color: var(--text);
+        padding: 11px 14px;
+        border-radius: var(--radius-sm);
+        text-align: center;
+        font-weight: 600;
+        font-size: 0.88em;
+        border: 1px solid var(--border);
+    }
+
+    @media (max-width: 600px) {
+        .page-content h1 { font-size: 2.1em; }
+        .page-content .section-card { padding: 25px 20px; }
+    }
+</style>
+</head>
+<body>
+
+    <div id="global-nav"></div>
+
+    <main class="page-content">
+        <h1>Guidelines</h1>
+
+        <div class="section-card" id="submission-section">
+            <h2>Submission Rules</h2>
+            <ul class="rule-list">
+                <li>Submissions must have audible clicks/taps or a handcam.</li>
+                <li>
+                    Videos may not be edited in any way if that affects important gameplay elements.
+                    <div class="note">This includes but is not limited to: cropping, cutting, audio modifications, and screen visibility.</div>
+                </li>
+                <li>
+                    Submissions have to be done on the browser version of GD, and cannot utilize any website/host that isn't on the list below:
+                    <div class="link-box">
+                        <a href="https://web-dashers.github.io" target="_blank">web-dashers.github.io</a>
+                        <a href="https://webdashers.dev" target="_blank">webdashers.dev</a>
+                    </div>
+                </li>
+                <li>
+                    You may <span class="b">only</span> use the following mods in your video:
+                    <div class="allowed-options">
+                        <div class="option-tag">Show Percentage</div>
+                        <div class="option-tag">Percentage Decimals</div>
+                        <div class="option-tag">Startpos Switcher</div>
+                        <div class="option-tag">Show FPS</div>
+                        <div class="option-tag">Show CPS</div>
+                        <div class="option-tag">Solid Wave Trail</div>
+                        <div class="option-tag">Hitboxes on Death</div>
+                        <div class="option-tag">LDM</div>
+                    </div>
+                </li>
+                <li>
+                    Userscripts and other external code injections that affect the game are also disallowed.
+                </li>
+                <li>
+                    You may bulk submit (aka use the same video for multiple submissions), but <b>providing timestamps is required.</b>
+                </li>
+                <li>
+                    Submit using <a href="https://webdemonlist.org/submit" target="_blank">this form</a>.
+                </li>
+            </ul>
+        </div>
+
+        <div class="section-card" id="verification-section">
+            <h2>Verification Rules</h2>
+            <ul class="rule-list">
+                <li>Levels will be created and published on the official GD servers.</li>
+                <li>
+                    Levels must be playable with only the supported objects on Web Dashers.
+                    <div class="note">
+                        <span class="b">Note:</span> If the level doesn't exactly match the original on the servers due to it using unsupported objects (like missing a few blocks or decoration), that's fine as long as it remains beatable and is mostly functional.
+                    </div>
+                </li>
+                <li>Levels must be 25 seconds long minimum. End-screens or long auto parts do not count towards this time.</li>
+                <li>Aim for decent gameplay and visual quality. Doesn't have to be rate worthy, but no recent tab stuff. Put some effort into creating levels...</li>
+                <li>Buffed, nerfed, or modified versions of existing list levels will NOT be accepted.</li>
+                <li>Upon completing the level, submission rules also apply.</li>
+            </ul>
+        </div>
+
+        <div class="section-card" id="impossible-section">
+            <h2>Impossible List Rules</h2>
+            <ul class="rule-list">
+                <li>Levels must be showcased inside of Web Dashers, using the built in bot tool.</li>
+                <li>Levels must also be "humanly possible". This means no sections should require higher than 20cps. Use of noclip or start positions when showcasing is not permitted.</li>
+                <li>Levels should meet the difficulty requirements set by the Scratch Demon List. Levels that were placed on the ILL prior to a new top 1 being verified are allowed to remain.</li>
+                <li>Levels need to be decently balanced. Don't make Stereo Madness with Silent Circles wave at the end or something.</li>
+                <li>
+                    The Scratch Demon List submission rules still apply.
+                </li>
+            </ul>
+        </div>
+    </main>
+
+    <script src="/nav.js"></script>
+    <script>
+        const isImpossibleList = window.location.hostname.includes('impossible');
+
+        if (isImpossibleList) {
+            document.body.classList.add('impossible-list');
+            document.getElementById('submission-section').style.display = 'none';
+            document.getElementById('verification-section').style.display = 'none';
+            document.getElementById('impossible-section').style.display = 'block';
+        } else {
+            document.getElementById('submission-section').style.display = 'block';
+            document.getElementById('verification-section').style.display = 'block';
+            document.getElementById('impossible-section').style.display = 'none';
+        }
+    </script>
+</body>
+</html>

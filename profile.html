@@ -1,0 +1,2435 @@
+<!DOCTYPE html>
+<html lang="en"> 
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Profile | Scratch Demon List</title>
+    <link rel="icon" type="image/png" href="/assets/icon.png">
+    <link rel="stylesheet" href="/style.css">
+    <style>
+        .page-content {
+            flex: 1 0 auto;
+            width: 100%;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 50px 20px 120px;
+            box-sizing: border-box;
+        }
+
+        .profile-header {
+            position: relative;
+            background: var(--surface);
+            padding: 40px;
+            border-radius: var(--radius);
+            border: 1px solid var(--border);
+            margin-bottom: 28px;
+            text-align: center;
+        }
+
+        .profile-header h1 {
+            margin: 0;
+            font-size: 2.1em;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
+        }
+
+        .user-id {
+            display: block;
+            color: var(--text-faint);
+            font-size: 0.34em;
+            margin-top: 8px;
+            letter-spacing: 0.5px;
+        }
+
+        .mod-badge {
+            height: 38px;
+            width: auto;
+        }
+
+        .profile-stats-section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 22px;
+            margin-bottom: 28px;
+        }
+
+        .stats-grid {
+            display: flex;
+            justify-content: center;
+            gap: 48px;
+            flex-wrap: wrap;
+        }
+
+        .stat-item {
+            text-align: center;
+            min-width: max-content;
+        }
+        .stat-label {
+            display: block;
+            color: var(--text-muted);
+            font-size: 0.75em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 6px;
+        }
+
+        .points-tag {
+            color: var(--accent);
+            font-family: var(--font-display);
+        }
+
+        .hardest-link {
+            background: none;
+            border: none;
+            padding: 0;
+            color: var(--text);
+            font: inherit;
+            font-size: 1.5em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: color 0.15s, opacity 0.15s;
+        }
+
+        .hardest-link:hover:not(:disabled) {
+            color: var(--accent);
+        }
+
+        .hardest-link:disabled {
+            cursor: default;
+            opacity: 1;
+        }
+
+
+
+        .profile-title-row {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 18px;
+            flex-wrap: wrap;
+        }
+
+        .profile-icon-wrap {
+            width: 96px;
+            height: 96px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 8px;
+            flex-shrink: 0;
+        }
+
+        .profile-icon-canvas-host {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .profile-icon-canvas-host.is-loading::after {
+            content: "...";
+            color: var(--text-muted);
+        }
+
+        .gd-icon-canvas {
+            width: 64px;
+            height: 64px;
+            max-width: 64px;
+            max-height: 64px;
+            object-fit: contain;
+            image-rendering: auto;
+        }
+
+        .profile-meta {
+            margin: 18px auto 0;
+            max-width: 640px;
+            display: grid;
+            gap: 12px;
+        }
+
+        .profile-bio {
+            color: var(--text);
+            line-height: 1.55;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .profile-details {
+            position: absolute;
+            top: 16px;
+            right: 66px;
+            display: block;
+            color: var(--text-muted);
+            font-size: 0.84em;
+            line-height: 1.45;
+            text-align: right;
+            white-space: pre-line;
+            max-width: min(430px, calc(100% - 170px));
+            z-index: 5;
+        }
+
+        .profile-socials {
+            position: absolute;
+            right: 16px;
+            bottom: 16px;
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            z-index: 5;
+        }
+
+        .profile-social-link {
+            width: 30px;
+            height: 30px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: transparent;
+            border: none;
+            border-radius: 0;
+            padding: 0;
+            color: var(--text-muted);
+            text-decoration: none;
+            transition: opacity 0.15s, transform 0.15s;
+        }
+
+        .profile-social-link:hover {
+            opacity: 0.78;
+            transform: translateY(-1px);
+        }
+
+        .profile-social-link img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+            pointer-events: none;
+            image-rendering: auto;
+        }
+
+        .discord-social {
+            position: relative;
+            cursor: pointer;
+        }
+
+        .discord-social::after {
+            content: attr(data-tooltip);
+            position: absolute;
+            left: 50%;
+            bottom: calc(100% + 8px);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text);
+            padding: 7px 10px;
+            font-size: 0.82rem;
+            font-weight: 700;
+            line-height: 1.2;
+            white-space: nowrap;
+            box-shadow: 0 10px 24px rgba(0,0,0,0.35);
+            opacity: 0;
+            transform: translate(-50%, 4px);
+            pointer-events: none;
+            transition: opacity 0.15s, transform 0.15s;
+            z-index: 30;
+        }
+
+        .discord-social:hover::after {
+            opacity: 1;
+            transform: translate(-50%, 0);
+        }
+
+        .discord-social.copied::after {
+            color: #00e676;
+        }
+
+        .back-link {
+            display: inline-block;
+            margin-top: 20px;
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 0.9em;
+        }
+        .back-link:hover { color: var(--text); }
+
+        .leaderboard-pos {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--bg);
+            padding: 6px 13px;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+        }
+
+        .leaderboard-pos img {
+            height: 22px;
+            width: auto;
+        }
+
+        .leaderboard-pos span {
+            font-family: var(--font-display);
+            font-size: 1em;
+            color: var(--text-muted);
+        }
+
+        .info-wrap {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+        }
+
+        .info-btn {
+            width: 38px;
+            height: 38px;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+            background: var(--bg);
+            color: var(--text);
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+            font-weight: 800;
+            transition: all 0.15s;
+        }
+
+        .info-btn:hover {
+            border-color: var(--accent);
+            background: var(--surface-2);
+        }
+
+        .info-panel {
+            position: absolute;
+            top: 48px;
+            right: 0;
+            width: 280px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            box-shadow: 0 10px 28px rgba(0,0,0,0.35);
+            padding: 16px;
+            text-align: left;
+            z-index: 20;
+        }
+
+        .info-panel.hidden {
+            display: none;
+        }
+
+        .info-panel h4 {
+            margin: 0 0 12px 0;
+            font-size: 1em;
+            color: var(--text);
+        }
+
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 7px 0;
+            border-top: 1px solid rgba(255,255,255,0.04);
+            font-size: 0.93em;
+        }
+
+        .info-row:first-of-type {
+            border-top: none;
+            padding-top: 0;
+        }
+
+        .info-key {
+            color: var(--text-muted);
+        }
+
+        .info-value {
+            color: var(--text);
+            font-weight: 700;
+            text-align: right;
+        }
+
+        h3 {
+            color: var(--text);
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 12px;
+            margin: 26px 0 16px;
+            font-size: 1.3em;
+        }
+
+        .section-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 22px;
+            margin-bottom: 22px;
+        }
+
+        .completed-list {
+            line-height: 2.05;
+            color: var(--text);
+            font-size: 1rem;
+            word-break: break-word;
+            margin-top: 10px;
+        }
+
+        .completed-link {
+            text-decoration: none;
+            transition: color 0.15s, opacity 0.15s;
+            color: white;
+            background: none;
+            border: none;
+            padding: 0;
+            font: inherit;
+            cursor: pointer;
+        }
+
+        .completed-link:hover {
+            color: var(--accent);
+            opacity: 0.95;
+        }
+
+        .tier-main {
+            font-size: 1.08em;
+            font-weight: 800;
+        }
+
+        .tier-extended {
+            font-size: 0.92em;
+            font-weight: 500;
+            opacity: 0.92;
+        }
+
+        .tier-legacy {
+            font-size: 0.82em;
+            font-weight: 400;
+            color: var(--text-faint, var(--text-muted));
+            opacity: 0.72;
+        }
+
+        .comma {
+            color: var(--text-muted);
+        }
+
+        .record-card {
+            background: var(--surface);
+            padding: 18px 20px;
+            margin-top: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border);
+            border-left: 3px solid var(--border);
+            transition: background 0.15s;
+            gap: 18px;
+            flex-wrap: wrap;
+        }
+
+        .record-card:hover { background: var(--surface-2); }
+
+        .level-link { color: var(--text); text-decoration: none; font-weight: 600; }
+        .level-link:hover { color: var(--accent); }
+
+        .rank-tag {
+            color: var(--text-muted);
+            margin-right: 10px;
+            font-weight: 600;
+        }
+
+        .completion { border-left-color: var(--accent); }
+        .progress { border-left-color: #d99a2b; }
+
+        .section-empty {
+            color: #666;
+            text-align: center;
+            padding: 20px 10px;
+        }
+
+        .section-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+        }
+
+        .completed-sort-wrap {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-muted);
+            font-size: 0.86em;
+            white-space: nowrap;
+        }
+
+        .completed-sort-wrap label {
+            color: var(--text-muted);
+            font-weight: 700;
+        }
+        .completed-sort-wrap label[for="completed-sort"] {
+            margin-left: 5px;
+        }
+
+        .completed-sort-select {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            color: var(--text);
+            padding: 7px 10px;
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        .completed-sort-select:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .section-subtext {
+            color: var(--text-muted);
+            font-size: 0.9em;
+            margin: -6px 0 14px;
+        }
+
+        .completion-modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.72);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+
+        .completion-modal-overlay.visible {
+            display: flex;
+        }
+
+        .completion-modal {
+            position: relative;
+            width: min(100%, 460px);
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+            padding: 22px;
+        }
+
+        .completion-modal-close-x {
+            position: absolute;
+            top: 16px;
+            right: 16px;
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1.5em;
+            line-height: 1;
+            cursor: pointer;
+            padding: 0;
+        }
+
+        .completion-modal-close-x:hover {
+            color: #ff4444;
+        }
+
+        .completion-modal h4 {
+            margin: 0 0 20px;
+            font-size: 1.25em;
+            color: var(--text);
+            word-break: break-word;
+        }
+
+        .completion-modal .modal-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 10px 0;
+            border-top: 1px solid rgba(255,255,255,0.06);
+            font-size: 0.96em;
+        }
+
+        .completion-modal .modal-row:first-of-type {
+            border-top: none;
+            padding-top: 0;
+        }
+
+        .completion-modal .modal-key {
+            color: var(--text-muted);
+        }
+
+        .completion-modal .modal-value {
+            color: var(--text);
+            font-weight: 700;
+            text-align: right;
+        }
+
+        .completion-modal .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-top: 18px;
+        }
+
+        .completion-modal .modal-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 10px 14px;
+            border-radius: var(--radius-sm);
+            border: 1px solid var(--border);
+            background: var(--surface);
+            color: var(--text-muted);
+            text-decoration: none;
+            cursor: pointer;
+            font-weight: 700;
+            transition: background 0.15s, border-color 0.15s, color 0.15s;
+        }
+
+        .completion-modal .modal-btn:hover {
+            border-color: var(--border);
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        .completion-modal .modal-close {
+            margin-right: 0;
+        }
+
+        .clickable-completion {
+            cursor: pointer;
+            text-decoration: none;
+        }
+
+        .clickable-completion:hover {
+            color: var(--accent);
+            opacity: 0.95;
+        }
+
+        @media (max-width: 700px) {
+            .stats-grid {
+                gap: 24px;
+            }
+
+            .profile-details,
+            .profile-socials {
+                position: static;
+                justify-content: center;
+                max-width: none;
+                margin-top: 12px;
+            }
+
+            .profile-meta {
+                display: grid;
+            }
+
+            .section-head {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+
+            .completed-sort-wrap {
+                width: 100%;
+                justify-content: flex-start;
+            }
+        }
+    
+
+        .moderator-profile-button {
+            position: absolute;
+            left: 16px;
+            bottom: 16px;
+            width: 48px;
+            height: 50px;
+            padding: 0;
+            border: 0;
+            border-radius: 0;
+            background: transparent;
+            cursor: pointer;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 6;
+        }
+
+        .moderator-profile-button:hover { transform: scale(1.05); }
+        .moderator-profile-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+        .moderator-profile-button img { width: 100%; height: 100%; object-fit: contain; display: block; }
+
+        .profile-badges-section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 22px;
+            margin-bottom: 28px;
+        }
+
+        .profile-badges-title {
+            text-align: center;
+            margin-bottom: 14px;
+        }
+        .profile-badges-grid { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; }
+
+        .profile-badge-button {
+            width: 64px;
+            height: 64px;
+            min-width: 64px;
+            min-height: 64px;
+            background: transparent;
+            border: 0;
+            border-radius: 0;
+            padding: 4px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font: inherit;
+            transition: transform 0.15s, filter 0.15s;
+        }
+
+        .profile-badge-button:hover { transform: scale(1.08); }
+        .profile-badge-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+        .profile-badge-button img { width: 56px; height: 56px; object-fit: contain; display: block; }
+
+        .badge-detail-modal,
+        .badge-grant-modal {
+            text-align: center;
+        }
+
+        .badge-detail-content {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            padding: 16px 8px 8px;
+        }
+
+        .badge-detail-icon {
+            width: 112px;
+            height: 112px;
+            object-fit: contain;
+            display: block;
+        }
+
+        .badge-detail-modal h4 {
+            margin: 0;
+            text-align: center;
+        }
+
+        .badge-detail-description {
+            margin: 0;
+            max-width: 380px;
+            color: var(--text-muted);
+            line-height: 1.55;
+            text-align: center;
+        }
+
+        .profile-badge-add-button {
+            width: 56px;
+            height: 56px;
+            min-width: 56px;
+            min-height: 56px;
+            border: 1px dashed var(--border);
+            border-radius: var(--radius-sm);
+            background: transparent;
+            color: var(--text-muted);
+            font: 700 2rem/1 var(--font-body);
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            transition: border-color 0.15s, color 0.15s, transform 0.15s;
+        }
+
+        .profile-badge-add-button:hover {
+            border-color: var(--accent);
+            color: var(--text);
+            transform: scale(1.05);
+        }
+
+        .badge-grant-controls {
+            display: grid;
+            gap: 12px;
+            margin-top: 18px;
+        }
+
+        .badge-grant-controls select,
+        .badge-grant-controls button {
+            width: 100%;
+            box-sizing: border-box;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 11px 12px;
+            font: inherit;
+        }
+
+        .badge-grant-controls select {
+            background: var(--bg);
+            color: var(--text);
+        }
+
+        .badge-grant-controls button {
+            background: var(--accent);
+            color: #000;
+            font-weight: 700;
+            cursor: pointer;
+        }
+
+        .staff-modal {
+            width: min(100%, 760px);
+            max-height: 85vh;
+            overflow-y: auto;
+        }
+        .staff-control-section { border-top: 1px solid var(--border); padding-top: 16px; margin-top: 16px; }
+        .staff-control-section h5 { margin: 0 0 10px; color: var(--text); font-size: 1rem; }
+        .staff-control-section input,
+        .staff-control-section select,
+        .staff-control-section textarea {
+            width: 100%;
+            box-sizing: border-box;
+            background: var(--bg);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 10px 11px;
+            font: inherit;
+            margin-bottom: 8px;
+        }
+        .staff-action-row { display: flex; gap: 8px; flex-wrap: wrap; }
+        .staff-action-row button {
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background: var(--surface-2);
+            color: var(--text);
+            padding: 9px 12px;
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+        }
+        .staff-action-row button.danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+
+        @media (max-width: 620px) {
+            .moderator-profile-button { left: 12px; bottom: 12px; width: 44px; height: 46px; }
+            .profile-badges-grid { justify-content: center; }
+        }
+</style>
+</head>
+<body>
+
+    <div id="global-nav"></div>
+
+    <main class="page-content">
+        <div id="profile-display" style="display: none;">
+            <div class="profile-header" id="header-box">
+                <button type="button" id="moderator-profile-button" class="moderator-profile-button" onclick="openModerationPanel()" aria-label="Moderate user" title="Moderate user">
+                    <img src="/assets/moderatorButton.png" alt="">
+                </button>
+
+                <div id="leaderboard-tag" class="leaderboard-pos" style="display: none;">
+                    <img id="trophy-icon" src="" alt="Trophy">
+                    <span id="leaderboard-rank">#0</span>
+                </div>
+
+                <div class="info-wrap">
+                    <button class="info-btn" id="info-btn" type="button" onclick="toggleInfoPanel()">i</button>
+                    <div class="info-panel hidden" id="info-panel">
+                        <h4>Demonlist Stats</h4>
+                        <div class="info-row">
+                            <span class="info-key">Main</span>
+                            <span class="info-value" id="info-main-count">0</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-key">Extended</span>
+                            <span class="info-value" id="info-extended-count">0</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-key">Legacy</span>
+                            <span class="info-value" id="info-legacy-count">0</span>
+                        </div>
+                        <div class="info-row">
+                            <span class="info-key">Joined</span>
+                            <span class="info-value" id="info-joined">N/A</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="profile-title-row">
+                    <div class="profile-icon-wrap" id="profile-icon-wrap" aria-hidden="true">
+                        <div id="profile-icon-canvas-host" class="profile-icon-canvas-host"></div>
+                    </div>
+
+                    <h1 id="user-name-container">
+                        <img id="role-badge" src="" class="mod-badge" style="display:none;">
+                        <div>
+                            <span id="user-name">Loading...</span>
+                            <span id="user-id-display" class="user-id"></span>
+                        </div>
+                    </h1>
+                </div>
+
+                <div class="profile-meta" id="profile-meta" style="display:none;">
+                    <div class="profile-bio" id="profile-bio"></div>
+                    <div class="profile-details" id="profile-details"></div>
+                    <div class="profile-socials" id="profile-socials"></div>
+                </div>
+
+
+            </div>
+
+            <div class="profile-stats-section">
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <span class="stat-label">Total Points</span>
+                        <span id="total-points" class="points-tag" style="font-size: 1.5em;">0.00</span>
+                    </div>
+                    <div class="stat-item" id="completions-stat">
+                        <span class="stat-label">List Completions</span>
+                        <span id="demon-count" style="font-size: 1.5em; font-weight: bold;">0</span>
+                    </div>
+                    <div class="stat-item" id="hardest-stat">
+                        <span class="stat-label">Hardest</span>
+                        <button type="button" id="current-hardest" class="hardest-link" disabled>N/A</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="profile-badges-section" id="profile-badges-section" style="display:none;">
+                <span class="stat-label profile-badges-title">Badges</span>
+                <div id="profile-badges-grid" class="profile-badges-grid"></div>
+            </div>
+
+            <div class="section-card" id="completed-section">
+                <div class="section-head">
+                    <h3 style="margin: 0;">Levels Beaten</h3>
+                    <div class="completed-sort-wrap">
+                        <label for="completed-filter">Filter</label>
+                        <select id="completed-filter" class="completed-sort-select" onchange="setCompletedFilter(this.value)">
+                            <option value="all" selected>All Records</option>
+                            <option value="verification">Verifications</option>
+                            <option value="first-victor">First Victor</option>
+                        </select>
+                        <label for="completed-sort">Sort</label>
+                        <select id="completed-sort" class="completed-sort-select" onchange="setCompletedSort(this.value)">
+                            <option value="recent" selected>Most recent</option>
+                            <option value="difficult">Most difficult</option>
+                            <option value="alphabetical">Alphabetical</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="completed-levels" class="completed-list"></div>
+            </div>
+
+            <div class="section-card">
+                <div class="section-head">
+                    <h3 style="margin: 0;">Progress On</h3>
+                </div>
+                <div id="progress-list"></div>
+            </div>
+        </div>
+
+        <div id="error-display" style="display: none; text-align: center; margin-top: 50px;">
+            <h1 style="color: #ff4444;">User Not Found</h1>
+            <p>The player you are looking for doesn't exist...</p>
+        </div>
+
+        <a href="/" class="back-link">Return to List</a>
+    </main>
+
+    <div class="completion-modal-overlay" id="completion-modal-overlay" aria-hidden="true">
+        <div class="completion-modal" role="dialog" aria-modal="true" aria-labelledby="completion-modal-title">
+            <button class="completion-modal-close-x" type="button" id="completion-modal-close" aria-label="Close">&times;</button>
+            <h4 id="completion-modal-title">Level</h4>
+            <div class="modal-row">
+                <span class="modal-key">Completion Status</span>
+                <span class="modal-value" id="completion-modal-status">N/A</span>
+            </div>
+            <div class="modal-row">
+                <span class="modal-key">Current placement</span>
+                <span class="modal-value" id="completion-modal-placement">N/A</span>
+            </div>
+            <div class="modal-row">
+                <span class="modal-key">Points earned</span>
+                <span class="modal-value" id="completion-modal-points">N/A</span>
+            </div>
+            <div class="modal-row" id="completion-modal-enjoyment-row" style="display:none;">
+                <span class="modal-key">Enjoyment</span>
+                <span class="modal-value" id="completion-modal-enjoyment">N/A</span>
+            </div>
+            <div class="modal-actions">
+                <a class="modal-btn" id="completion-modal-demon" href="#" target="_blank" rel="noopener">Level Page</a>
+                <a class="modal-btn" id="completion-modal-video" href="#" target="_blank" rel="noopener">Watch</a>
+            </div>
+        </div>
+    </div>
+
+    <div class="completion-modal-overlay" id="badge-modal-overlay" aria-hidden="true">
+        <div class="completion-modal badge-detail-modal" role="dialog" aria-modal="true" aria-labelledby="badge-modal-name">
+            <button class="completion-modal-close-x" type="button" onclick="closeBadgeModal()" aria-label="Close">&times;</button>
+            <div class="badge-detail-content">
+                <img id="badge-modal-icon" class="badge-detail-icon" src="/assets/icon.png" alt="">
+                <h4 id="badge-modal-name">Badge</h4>
+                <p id="badge-modal-description" class="badge-detail-description"></p>
+            </div>
+        </div>
+    </div>
+
+    <div class="completion-modal-overlay" id="badge-grant-modal-overlay" aria-hidden="true">
+        <div class="completion-modal badge-grant-modal" role="dialog" aria-modal="true" aria-labelledby="badge-grant-title">
+            <button class="completion-modal-close-x" type="button" onclick="closeBadgeGrantModal()" aria-label="Close">&times;</button>
+            <h4 id="badge-grant-title">Add Badge</h4>
+            <div class="badge-grant-controls">
+                <select id="badge-grant-select" aria-label="Badge to add"></select>
+                <button type="button" onclick="grantSelectedBadge()">Add badge</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="completion-modal-overlay" id="moderation-modal-overlay" aria-hidden="true">
+        <div class="completion-modal staff-modal" role="dialog" aria-modal="true" aria-labelledby="moderation-modal-title">
+            <button class="completion-modal-close-x" type="button" onclick="closeModerationPanel()" aria-label="Close">&times;</button>
+            <h4 id="moderation-modal-title">Moderate User</h4>
+            <div id="moderation-modal-content"><p style="color:var(--text-muted);">Loading...</p></div>
+        </div>
+    </div>
+
+    <script src="/nav.js"></script>
+    <script>
+        const isImpossibleList = window.location.hostname.includes('impossible');
+
+        if (isImpossibleList) {
+            document.body.classList.add('impossible-list');
+        }
+
+
+        const WBDLIconRenderer = (() => {
+            const ICON_CATEGORY_CONFIG = {
+                cube: { key: 'cube', label: 'Cube', folder: 'cubes', prefix: 'player' },
+                ship: { key: 'ship', label: 'Ship', folder: 'ships', prefix: 'ship' },
+                ball: { key: 'ball', label: 'Ball', folder: 'balls', prefix: 'player_ball' },
+                ufo: { key: 'ufo', label: 'UFO', folder: 'ufos', prefix: 'bird' },
+                wave: { key: 'wave', label: 'Wave', folder: 'waves', prefix: 'dart' },
+                robot: { key: 'robot', label: 'Robot', folder: 'robots', prefix: 'robot' },
+                spider: { key: 'spider', label: 'Spider', folder: 'spiders', prefix: 'spider' },
+                swing: { key: 'swing', label: 'Swing', folder: 'swings', prefix: 'swing' },
+                jetpack: { key: 'jetpack', label: 'Jetpack', folder: 'jetpacks', prefix: 'jetpack' },
+            };
+
+            let colorsPromise = null;
+            const animDescCache = {};
+
+            function getCategory(type) {
+                return ICON_CATEGORY_CONFIG[type] || ICON_CATEGORY_CONFIG.cube;
+            }
+
+            function getCategories() {
+                return Object.values(ICON_CATEGORY_CONFIG);
+            }
+
+            function getAssetUrl(path) {
+                return new URL(path.replace(/^\/+/, ''), window.location.origin + '/').href;
+            }
+
+            async function loadColors() {
+                if (!colorsPromise) {
+                    colorsPromise = fetch('/assets/colors.json')
+                        .then(res => res.ok ? res.json() : {})
+                        .catch(() => ({}));
+                }
+                return colorsPromise;
+            }
+
+            async function getColor(colorId, fallback) {
+                const colors = await loadColors();
+                const color = colors[String(colorId)] || fallback;
+                return {
+                    r: Number(color?.r ?? fallback.r),
+                    g: Number(color?.g ?? fallback.g),
+                    b: Number(color?.b ?? fallback.b),
+                };
+            }
+
+            function parsePlistFrames(xmlText) {
+                const cleaned = String(xmlText || '').replace(/^[^<]+/, '').replace(/<!DOCTYPE[^[>]*(?:\[[^\]]*\])?>/i, '');
+                const doc = new DOMParser().parseFromString(cleaned, 'text/xml');
+
+                function parseNode(el) {
+                    switch (el.tagName) {
+                        case 'dict': {
+                            const obj = {};
+                            const kids = Array.from(el.children);
+                            for (let i = 0; i + 1 < kids.length; i += 2) {
+                                obj[kids[i].textContent] = parseNode(kids[i + 1]);
+                            }
+                            return obj;
+                        }
+                        case 'array': return Array.from(el.children).map(parseNode);
+                        case 'string': return el.textContent;
+                        case 'integer': return parseInt(el.textContent, 10);
+                        case 'real': return parseFloat(el.textContent);
+                        case 'true': return true;
+                        case 'false': return false;
+                        default: return el.textContent;
+                    }
+                }
+
+                if (doc.querySelector('parsererror')) return {};
+                const rootEl = doc.querySelector('plist > dict') || doc.querySelector('dict');
+                if (!rootEl) return {};
+                const root = parseNode(rootEl);
+                return (root && root.frames) || root || {};
+            }
+
+            function parseGDCoord(str) {
+                return ((str || '').match(/-?\d+(?:\.\d+)?/g) || []).map(Number);
+            }
+
+            function normalizeAtlasFrame(frame) {
+                if (!frame) return null;
+                return {
+                    textureRect: frame.textureRect || frame.frame || frame.frameRect || frame.rect || null,
+                    spriteSourceSize: frame.spriteSourceSize || frame.sourceSize || frame.spriteSize || frame.spriteRect || null,
+                    spriteOffset: frame.spriteOffset || frame.offset || '{0,0}',
+                    textureRotated: frame.textureRotated ?? frame.rotated ?? false,
+                };
+            }
+
+            function getAtlasRenderPrefix(frameKeys, baseName) {
+                const hasMatchingFrames = frameKeys.some(key => key.startsWith(`${baseName}_`) && key.endsWith('_001.png'));
+                return hasMatchingFrames ? baseName : null;
+            }
+
+            function compareAtlasLayers(left, right) {
+                const parseInfo = (key) => {
+                    const tokens = key.replace(/_001\.png$/, '').split('_').slice(2);
+                    const isExtra = tokens.includes('extra');
+                    const isNumberedPart = !isExtra && tokens.length > 1 && /^\d+$/.test(tokens[1]);
+                    const priority = isExtra ? 2 : isNumberedPart ? 1 : 0;
+                    const normalizedTokens = tokens.map(token => (/^\d+$/.test(token) ? Number(token) : token));
+                    return { priority, tokens: normalizedTokens };
+                };
+
+                const leftInfo = parseInfo(left);
+                const rightInfo = parseInfo(right);
+                if (leftInfo.priority !== rightInfo.priority) return leftInfo.priority - rightInfo.priority;
+
+                const maxLength = Math.max(leftInfo.tokens.length, rightInfo.tokens.length);
+                for (let i = 0; i < maxLength; i++) {
+                    const l = leftInfo.tokens[i];
+                    const r = rightInfo.tokens[i];
+                    if (l === undefined) return -1;
+                    if (r === undefined) return 1;
+                    if (l === r) continue;
+                    if (typeof l === 'number' && typeof r === 'number') return l - r;
+                    if (typeof l === 'number') return -1;
+                    if (typeof r === 'number') return 1;
+                    return String(l).localeCompare(String(r));
+                }
+                return left.localeCompare(right);
+            }
+
+            function tintCanvas(canvas, color, keepShading = true) {
+                const ctx = canvas.getContext('2d');
+                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const pixels = imageData.data;
+
+                for (let i = 0; i < pixels.length; i += 4) {
+                    const alpha = pixels[i + 3];
+                    if (!alpha) continue;
+
+                    const r = pixels[i];
+                    const g = pixels[i + 1];
+                    const b = pixels[i + 2];
+                    const brightness = (r + g + b) / 3;
+
+                    if (brightness < 52) {
+                        continue;
+                    }
+
+                    const shade = keepShading
+                        ? Math.max(0.35, Math.min(1, brightness / 255))
+                        : 1;
+
+                    pixels[i] = Math.round(color.r * shade);
+                    pixels[i + 1] = Math.round(color.g * shade);
+                    pixels[i + 2] = Math.round(color.b * shade);
+                }
+
+                ctx.putImageData(imageData, 0, 0);
+                return canvas;
+            }
+
+            function makeFallbackCanvas(label = '?') {
+                const canvas = document.createElement('canvas');
+                canvas.width = 96;
+                canvas.height = 96;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = 'rgba(255,255,255,0.08)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+                ctx.strokeRect(0.5, 0.5, canvas.width - 1, canvas.height - 1);
+                ctx.fillStyle = 'rgba(255,255,255,0.72)';
+                ctx.font = 'bold 42px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.imageSmoothingEnabled = true;
+                ctx.imageSmoothingQuality = 'high';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(label, canvas.width / 2, canvas.height / 2);
+                return canvas;
+            }
+
+            async function renderIcon({ type = 'cube', id = 1, color1 = 12, color2 = 3, glow = -1 } = {}, options = {}) {
+                const category = getCategory(type);
+                const iconNum = Math.max(1, parseInt(id, 10) || 1);
+                const numStr = String(iconNum).padStart(2, '0');
+                const baseName = `${category.prefix}_${numStr}`;
+                const assetQuality = options.quality === 'uhd' ? 'uhd' : 'hd';
+                const assetName = `${baseName}-${assetQuality}`;
+                const iconPath = `/assets/icons/${category.folder}/${assetName}`;
+
+                const [mainColor, secondColor, glowColor] = await Promise.all([
+                    getColor(color1, { r: 0, g: 230, b: 118 }),
+                    getColor(color2, { r: 255, g: 255, b: 255 }),
+                    getColor(glow, { r: 255, g: 255, b: 255 }),
+                ]);
+
+                let frames;
+                try {
+                    const resp = await fetch(`${iconPath}.plist`);
+                    if (!resp.ok) return makeFallbackCanvas(String(iconNum));
+                    frames = parsePlistFrames(await resp.text());
+                } catch (err) {
+                    return makeFallbackCanvas(String(iconNum));
+                }
+
+                const texture = await new Promise(resolve => {
+                    const img = new Image();
+                    img.onload = () => resolve(img);
+                    img.onerror = () => resolve(null);
+                    img.src = getAssetUrl(`${iconPath}.png`);
+                });
+                if (!texture) return makeFallbackCanvas(String(iconNum));
+
+                const frameKeys = Object.keys(frames);
+                const renderPrefix = getAtlasRenderPrefix(frameKeys, baseName);
+                if (!renderPrefix) return makeFallbackCanvas(String(iconNum));
+                const baseLen = renderPrefix.length + 1;
+
+                const glowLayerKeys = frameKeys
+                    .filter(key => key.startsWith(`${renderPrefix}_`) && key.endsWith('_001.png') && key.includes('_glow_'))
+                    .sort(compareAtlasLayers);
+
+                const layerKeys = frameKeys
+                    .filter(key => key.startsWith(`${renderPrefix}_`) && key.endsWith('_001.png') && !key.includes('_glow_'))
+                    .sort(compareAtlasLayers)
+                    .sort((left, right) => {
+                        const leftPart = left.slice(baseLen, -'_001.png'.length);
+                        const rightPart = right.slice(baseLen, -'_001.png'.length);
+                        const leftIsBody = leftPart === '001';
+                        const rightIsBody = rightPart === '001';
+                        const leftIsSecond = /(?:^|_)0*2$/.test(leftPart);
+                        const rightIsSecond = /(?:^|_)0*2$/.test(rightPart);
+                        if (leftIsSecond !== rightIsSecond) return leftIsSecond ? -1 : 1;
+                        if (leftIsBody !== rightIsBody) return leftIsBody ? 1 : -1;
+                        return 0;
+                    });
+
+                if (!layerKeys.length) return makeFallbackCanvas(String(iconNum));
+
+                if (category.key === 'robot' || category.key === 'spider') {
+                    const animDescFilename = category.key === 'robot' ? 'Robot_AnimDesc.plist' : 'Spider_AnimDesc.plist';
+                    const animDescUrl = getAssetUrl(`/assets/icons/${animDescFilename}`);
+
+                    if (animDescCache[animDescUrl] === undefined) {
+                        try {
+                            const ar = await fetch(animDescUrl);
+                            animDescCache[animDescUrl] = ar.ok ? parsePlistFrames(await ar.text()) : null;
+                        } catch (err) {
+                            animDescCache[animDescUrl] = null;
+                        }
+                    }
+
+                    const animDesc = animDescCache[animDescUrl];
+
+                    const idleKey = category.key === 'robot' ? 'Robot_idle_001.png' : 'Spider_idle_001.png';
+                    const idleFrame = animDesc && animDesc.animationContainer && animDesc.animationContainer[idleKey];
+
+                    if (idleFrame) {
+                        const SCALE = assetQuality === 'uhd' ? 4 : 2;
+                        const prefix01 = `${category.prefix}_01_`;
+
+                        function actualTex(name) {
+                            return String(name || '').replace(prefix01, `${renderPrefix}_`);
+                        }
+
+                        const spriteList = Object.values(idleFrame)
+                            .filter(sprite => sprite && sprite.texture)
+                            .sort((a, b) => (parseInt(a.zValue, 10) || 0) - (parseInt(b.zValue, 10) || 0));
+
+                        let minX = 0;
+                        let minY = 0;
+                        let maxX = 1;
+                        let maxY = 1;
+
+                        function getSpriteTransform(sprite) {
+                            const [px = 0, py = 0] = parseGDCoord(sprite.position);
+                            const [sxRaw = 1, syRaw = 1] = parseGDCoord(sprite.scale);
+                            const [flipXRaw = 0, flipYRaw = 0] = parseGDCoord(sprite.flipped);
+                            const sx = Number.isFinite(sxRaw) ? sxRaw : 1;
+                            const sy = Number.isFinite(syRaw) ? syRaw : 1;
+                            const rot = (parseFloat(sprite.rotation) || 0) * Math.PI / 180;
+                            const flipX = flipXRaw ? -1 : 1;
+                            const flipY = flipYRaw ? -1 : 1;
+                            return { px, py, sx, sy, rot, flipX, flipY };
+                        }
+
+                        for (const sprite of spriteList) {
+                            const frame = normalizeAtlasFrame(frames[actualTex(sprite.texture)]);
+                            if (!frame) continue;
+
+                            const [, , rw = 0, rh = 0] = parseGDCoord(frame.textureRect);
+                            const [ox = 0, oy = 0] = parseGDCoord(frame.spriteOffset);
+                            const { px, py, sx, sy, rot, flipX, flipY } = getSpriteTransform(sprite);
+                            const cosR = Math.cos(rot);
+                            const sinR = Math.sin(rot);
+
+                            for (const [cornerX, cornerY] of [
+                                [ox - rw / 2, -oy - rh / 2],
+                                [ox + rw / 2, -oy - rh / 2],
+                                [ox - rw / 2, -oy + rh / 2],
+                                [ox + rw / 2, -oy + rh / 2],
+                            ]) {
+                                const scx = cornerX * sx * flipX;
+                                const scy = cornerY * sy * flipY;
+                                const wx = px * SCALE + scx * cosR - scy * sinR;
+                                const wy = -py * SCALE + scx * sinR + scy * cosR;
+                                if (wx < minX) minX = wx;
+                                if (wx > maxX) maxX = wx;
+                                if (wy < minY) minY = wy;
+                                if (wy > maxY) maxY = wy;
+                            }
+                        }
+
+                        const renderScale = 2;
+                        const logicalW = Math.max(1, Math.ceil(maxX - minX));
+                        const logicalH = Math.max(1, Math.ceil(maxY - minY));
+                        const canvas = document.createElement('canvas');
+                        canvas.width = logicalW * renderScale;
+                        canvas.height = logicalH * renderScale;
+                        canvas.style.width = `${logicalW}px`;
+                        canvas.style.height = `${logicalH}px`;
+                        const ctx = canvas.getContext('2d');
+                        ctx.imageSmoothingEnabled = true;
+                        ctx.imageSmoothingQuality = 'high';
+                        ctx.scale(renderScale, renderScale);
+
+                        function drawTex(texName, sprite, tintColor) {
+                            const frame = normalizeAtlasFrame(frames[texName]);
+                            if (!frame) return;
+
+                            const [rx, ry, rw, rh] = parseGDCoord(frame.textureRect);
+                            const [ox = 0, oy = 0] = parseGDCoord(frame.spriteOffset);
+                            const rotated = frame.textureRotated === true;
+
+                            const tmp = document.createElement('canvas');
+                            tmp.width = rw;
+                            tmp.height = rh;
+                            const tctx = tmp.getContext('2d');
+                            tctx.imageSmoothingEnabled = true;
+                            tctx.imageSmoothingQuality = 'high';
+
+                            if (rotated) {
+                                tctx.save();
+                                tctx.translate(rw / 2, rh / 2);
+                                tctx.rotate(-Math.PI / 2);
+                                tctx.drawImage(texture, rx, ry, rh, rw, -rh / 2, -rw / 2, rh, rw);
+                                tctx.restore();
+                            } else {
+                                tctx.drawImage(texture, rx, ry, rw, rh, 0, 0, rw, rh);
+                            }
+
+                            if (tintColor) {
+                                tintCanvas(tmp, tintColor, true);
+                            }
+
+                            const { px, py, sx, sy, rot, flipX, flipY } = getSpriteTransform(sprite);
+                            ctx.save();
+                            ctx.translate(-minX + px * SCALE, -minY - py * SCALE);
+                            ctx.rotate(rot);
+                            ctx.scale(sx * flipX, sy * flipY);
+                            ctx.drawImage(tmp, 0, 0, rw, rh, ox - rw / 2, -oy - rh / 2, rw, rh);
+                            ctx.restore();
+                        }
+
+                        if (Number(glow) >= 0) {
+                            for (const sprite of spriteList) {
+                                const mainName = actualTex(sprite.texture);
+                                drawTex(mainName.replace('_001.png', '_glow_001.png'), sprite, glowColor);
+                            }
+                        }
+
+                        for (const sprite of spriteList) {
+                            const mainName = actualTex(sprite.texture);
+                            drawTex(mainName.replace('_001.png', '_2_001.png'), sprite, secondColor);
+                        }
+
+                        for (const sprite of spriteList) {
+                            const mainName = actualTex(sprite.texture);
+                            drawTex(mainName, sprite, mainColor);
+                        }
+
+                        for (const sprite of spriteList) {
+                            const mainName = actualTex(sprite.texture);
+                            drawTex(mainName.replace('_001.png', '_extra_001.png'), sprite, null);
+                        }
+
+                        return canvas;
+                    }
+                }
+
+                let canvW = 1;
+                let canvH = 1;
+                for (const key of [...layerKeys, ...(Number(glow) >= 0 ? glowLayerKeys : [])]) {
+                    const frame = normalizeAtlasFrame(frames[key]);
+                    if (!frame) continue;
+                    const [ssw, ssh] = parseGDCoord(frame.spriteSourceSize);
+                    if (ssw > canvW) canvW = ssw;
+                    if (ssh > canvH) canvH = ssh;
+                }
+
+                const renderScale = 2;
+                const logicalW = Math.max(1, Math.ceil(canvW));
+                const logicalH = Math.max(1, Math.ceil(canvH));
+                const canvas = document.createElement('canvas');
+                canvas.width = logicalW * renderScale;
+                canvas.height = logicalH * renderScale;
+                canvas.style.width = `${logicalW}px`;
+                canvas.style.height = `${logicalH}px`;
+                const ctx = canvas.getContext('2d');
+                ctx.imageSmoothingEnabled = true;
+                ctx.imageSmoothingQuality = 'high';
+                ctx.scale(renderScale, renderScale);
+
+                function drawAtlasLayer(key, tintColor = null) {
+                    const frame = normalizeAtlasFrame(frames[key]);
+                    if (!frame) return;
+
+                    const [rx, ry, rw, rh] = parseGDCoord(frame.textureRect);
+                    const [ox = 0, oy = 0] = parseGDCoord(frame.spriteOffset);
+                    const rotated = frame.textureRotated === true;
+                    const tmp = document.createElement('canvas');
+                    tmp.width = rw;
+                    tmp.height = rh;
+                    const tctx = tmp.getContext('2d');
+                    tctx.imageSmoothingEnabled = true;
+                    tctx.imageSmoothingQuality = 'high';
+
+                    if (rotated) {
+                        tctx.save();
+                        tctx.translate(rw / 2, rh / 2);
+                        tctx.rotate(-Math.PI / 2);
+                        tctx.drawImage(texture, rx, ry, rh, rw, -rh / 2, -rw / 2, rh, rw);
+                        tctx.restore();
+                    } else {
+                        tctx.drawImage(texture, rx, ry, rw, rh, 0, 0, rw, rh);
+                    }
+
+                    if (tintColor) {
+                        tintCanvas(tmp, tintColor, true);
+                    }
+
+                    const ufoYOffset = category.key === 'ufo' ? 10 : 0;
+                    const dx = logicalW / 2 + ox - rw / 2;
+                    const dy = logicalH / 2 - oy - rh / 2 + ufoYOffset;
+                    ctx.drawImage(tmp, 0, 0, rw, rh, dx, dy, rw, rh);
+                }
+
+                if (Number(glow) >= 0) {
+                    for (const key of glowLayerKeys) {
+                        drawAtlasLayer(key, glowColor);
+                    }
+                }
+
+                for (const key of layerKeys) {
+                    const part = key.slice(baseLen, -'_001.png'.length);
+                    const isSecondary = /(?:^|_)0*2$/.test(part);
+                    const isExtra = /extra/.test(part);
+                    drawAtlasLayer(key, isExtra ? null : (isSecondary ? secondColor : mainColor));
+                }
+
+                return canvas;
+            }
+
+            async function renderInto(host, icon, options = {}) {
+                if (!host) return;
+                host.textContent = '';
+                host.classList.add('is-loading');
+                const rendered = await renderIcon(icon, options);
+                rendered.className = 'gd-icon-canvas';
+                rendered.style.imageRendering = 'auto';
+                host.classList.remove('is-loading');
+                host.replaceChildren(rendered);
+            }
+
+            return { getCategories, loadColors, renderIcon, renderInto };
+        })();
+
+
+        let completedRecordsCache = [];
+        let completedSortMode = 'recent';
+        let completedFilterMode = 'all';
+        let hardestRecordCache = null;
+        let currentProfileData = null;
+        let moderationPanelData = null;
+        let pendingModerationAction = null;
+
+        function escapeHtml(str) {
+            return String(str ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+
+
+        function normalizeSocialUrl(platform, value) {
+            const raw = String(value || '').trim();
+            if (!raw) return '';
+            if (/^https?:\/\//i.test(raw)) return raw;
+            const clean = raw.replace(/^@/, '').replace(/^u\//i, '').replace(/^\/+/, '');
+
+            switch (platform) {
+                case 'youtube': return `https://youtube.com/${clean.startsWith('@') ? clean : '@' + clean}`;
+                case 'twitter': return `https://x.com/${clean}`;
+                case 'twitch': return `https://twitch.tv/${clean}`;
+                case 'reddit': return `https://reddit.com/user/${clean}`;
+                case 'gdbrowser': return `https://gdbrowser.com/u/${clean}`;
+                default: return '';
+            }
+        }
+
+        function getSocialDisplayValue(platform, value) {
+            const raw = String(value || '').trim();
+            if (!raw) return '';
+            if (platform === 'discord') return raw;
+            if (/^https?:\/\//i.test(raw)) {
+                try {
+                    const url = new URL(raw);
+                    return url.hostname.replace(/^www\./, '');
+                } catch (err) {
+                    return raw;
+                }
+            }
+            return raw;
+        }
+
+        function getSocialIconSrc(platform) {
+            const icons = {
+                youtube: '/assets/socials/youtube.png',
+                twitter: '/assets/socials/twitter.png',
+                twitch: '/assets/socials/twitch.png',
+                discord: '/assets/socials/discord.png',
+                reddit: '/assets/socials/reddit.png',
+                gdbrowser: '/assets/socials/gdbrowser.png',
+            };
+            return icons[platform] || '';
+        }
+
+        function makeSocialIcon(platform, label, href) {
+            const icon = getSocialIconSrc(platform);
+            const safeLabel = escapeHtml(label);
+            return `<a class="profile-social-link" href="${escapeHtml(href)}" target="_blank" rel="noopener" aria-label="${safeLabel}">
+                <img src="${escapeHtml(icon)}" alt="${safeLabel}">
+            </a>`;
+        }
+
+        function copyTextFallback(text) {
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.setAttribute('readonly', '');
+            textarea.style.position = 'fixed';
+            textarea.style.left = '-9999px';
+            document.body.appendChild(textarea);
+            textarea.select();
+            try {
+                document.execCommand('copy');
+            } catch (err) {}
+            textarea.remove();
+        }
+
+        async function copyDiscordUsername(el) {
+            if (!el) return;
+            const username = el.getAttribute('data-discord') || '';
+            if (!username) return;
+
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(username);
+                } else {
+                    copyTextFallback(username);
+                }
+            } catch (err) {
+                copyTextFallback(username);
+            }
+
+            el.classList.add('copied');
+            el.setAttribute('data-tooltip', 'Copied!');
+        }
+
+        function resetDiscordTooltip(el) {
+            if (!el) return;
+            const username = el.getAttribute('data-discord') || '';
+            el.classList.remove('copied');
+            el.setAttribute('data-tooltip', username);
+        }
+
+        function makeDiscordIcon(username) {
+            const safeUsername = escapeHtml(username);
+            return `<span class="profile-social-link discord-social" role="button" tabindex="0" aria-label="Copy Discord username" data-discord="${safeUsername}" data-tooltip="${safeUsername}" onclick="copyDiscordUsername(this)" onmouseleave="resetDiscordTooltip(this)" onkeydown="if(event.key === 'Enter' || event.key === ' '){ event.preventDefault(); copyDiscordUsername(this); }">
+                <img src="${escapeHtml(getSocialIconSrc('discord'))}" alt="Discord">
+            </span>`;
+        }
+
+        function renderProfileExtras(data) {
+            const meta = document.getElementById('profile-meta');
+            const bio = document.getElementById('profile-bio');
+            const details = document.getElementById('profile-details');
+            const socials = document.getElementById('profile-socials');
+
+            const bioText = String(data.bio || '').trim();
+            const detailLines = [];
+            if (String(data.pronouns || '').trim()) detailLines.push(`Pronouns: ${String(data.pronouns).trim()}`);
+            if (String(data.country || '').trim()) detailLines.push(`Location: ${String(data.country).trim()}`);
+
+            const socialLinks = data.socialLinks || {};
+            const socialParts = [];
+
+            const youtubeValue = socialLinks.youtube;
+            const youtubeHref = normalizeSocialUrl('youtube', youtubeValue);
+            if (youtubeHref) {
+                socialParts.push(makeSocialIcon('youtube', 'YouTube', youtubeHref));
+            }
+
+            const twitterValue = socialLinks.twitter;
+            const twitterHref = normalizeSocialUrl('twitter', twitterValue);
+            if (twitterHref) {
+                socialParts.push(makeSocialIcon('twitter', 'Twitter', twitterHref));
+            }
+
+            const discordValue = String(data.discordUsername || socialLinks.discord || '').trim();
+            if (discordValue) {
+                socialParts.push(makeDiscordIcon(discordValue));
+            }
+
+            const twitchValue = socialLinks.twitch;
+            const twitchHref = normalizeSocialUrl('twitch', twitchValue);
+            if (twitchHref) {
+                socialParts.push(makeSocialIcon('twitch', 'Twitch', twitchHref));
+            }
+
+            const redditValue = socialLinks.reddit;
+            const redditHref = normalizeSocialUrl('reddit', redditValue);
+            if (redditHref) {
+                socialParts.push(makeSocialIcon('reddit', 'Reddit', redditHref));
+            }
+
+            const gdBrowserValue = socialLinks.gdbrowser;
+            const gdBrowserHref = normalizeSocialUrl('gdbrowser', gdBrowserValue);
+            if (gdBrowserHref) {
+                socialParts.push(makeSocialIcon('gdbrowser', 'GDBrowser', gdBrowserHref));
+            }
+
+            bio.innerText = bioText;
+            bio.style.display = bioText ? 'block' : 'none';
+            details.innerText = detailLines.join('\n');
+
+            socials.innerHTML = socialParts.join('');
+            details.style.display = detailLines.length ? 'block' : 'none';
+            socials.style.display = socials.innerHTML ? 'flex' : 'none';
+
+            const hasMeta = bioText || detailLines.length || socials.innerHTML;
+            meta.style.display = hasMeta ? 'grid' : 'none';
+        }
+
+        function renderProfileIcon(data) {
+            const host = document.getElementById('profile-icon-canvas-host');
+            WBDLIconRenderer.renderInto(
+                host,
+                data.icon || { type: 'cube', id: 1, color1: 12, color2: 3, glow: -1 },
+                { quality: 'uhd' }
+            );
+        }
+
+
+        function getTier(position) {
+            const pos = parseInt(position, 10);
+            if (Number.isNaN(pos)) return 'legacy';
+            if (pos <= 75) return 'main';
+            if (pos <= 150) return 'extended';
+            return 'legacy';
+        }
+
+        function getHardestRecord(records) {
+            const valid = Array.isArray(records)
+                ? records.filter(r => 
+                    Number.isFinite(parseInt(r.position, 10)) && 
+                    parseInt(r.percentage, 10) === 100
+                )
+                : [];
+            if (valid.length === 0) return null;
+
+            return valid.slice().sort((a, b) => {
+                const aPos = parseInt(a.position, 10) || Number.MAX_SAFE_INTEGER;
+                const bPos = parseInt(b.position, 10) || Number.MAX_SAFE_INTEGER;
+                if (aPos !== bPos) return aPos - bPos;
+
+                const aId = parseInt(a.record_id, 10) || 0;
+                const bId = parseInt(b.record_id, 10) || 0;
+                return bId - aId;
+            })[0];
+        }
+
+        function formatJoinedDate(joined) {
+            if (!joined) return 'N/A';
+            const d = new Date(joined);
+            if (Number.isNaN(d.getTime())) return String(joined);
+            return d.toLocaleDateString(undefined, {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric'
+            });
+        }
+
+        function toggleInfoPanel() {
+            const panel = document.getElementById('info-panel');
+            panel.classList.toggle('hidden');
+        }
+
+        document.addEventListener('click', (e) => {
+            const wrap = document.querySelector('.info-wrap');
+            const panel = document.getElementById('info-panel');
+            if (!wrap || !panel) return;
+            if (!wrap.contains(e.target)) {
+                panel.classList.add('hidden');
+            }
+        });
+
+        function ordinalSuffix(num) {
+            const n = Math.abs(parseInt(num, 10));
+            if (!Number.isFinite(n)) return '';
+            const mod100 = n % 100;
+            if (mod100 >= 11 && mod100 <= 13) return 'th';
+            switch (n % 10) {
+                case 1: return 'st';
+                case 2: return 'nd';
+                case 3: return 'rd';
+                default: return 'th';
+            }
+        }
+
+        function getCompletionStatusLabel(status) {
+            const n = parseInt(status, 10);
+            if (Number.isNaN(n)) return 'Unknown';
+            if (n === 0) return 'Verifier';
+            return `${n}${ordinalSuffix(n)} Victor`;
+        }
+
+        function getPlacementLabel(position) {
+            const num = parseInt(position, 10);
+            if (Number.isNaN(num)) return 'N/A';
+
+            let tier;
+            if (num <= 75) {
+                tier = 'Main List';
+            } else if (num <= 150) {
+                tier = 'Extended List';
+            } else {
+                return "Legacy List";
+            }
+
+            return `#${num}, ${tier}`;
+        }
+
+        function openCompletionModal({ name, placement, status, videoUrl, points, demonUrl, enjoymentRating }) {
+            const overlay = document.getElementById('completion-modal-overlay');
+            document.getElementById('completion-modal-title').innerText = name || 'Level';
+            document.getElementById('completion-modal-status').innerText = status || 'Unknown';
+            document.getElementById('completion-modal-placement').innerText = placement || 'N/A';
+            document.getElementById('completion-modal-points').innerText =
+                (points !== undefined && points !== null && points !== '') ? points : 'N/A';
+
+            const enjoymentRow = document.getElementById('completion-modal-enjoyment-row');
+            const enjoymentValue = document.getElementById('completion-modal-enjoyment');
+            if (enjoymentRating !== undefined && enjoymentRating !== null && enjoymentRating !== '') {
+                enjoymentValue.innerText = `${enjoymentRating}/10`;
+                enjoymentRow.style.display = 'flex';
+            } else {
+                enjoymentValue.innerText = 'N/A';
+                enjoymentRow.style.display = 'none';
+            }
+
+            const demonBtn = document.getElementById('completion-modal-demon');
+            if (demonUrl) {
+                demonBtn.href = demonUrl;
+                demonBtn.style.display = 'inline-flex';
+            } else {
+                demonBtn.removeAttribute('href');
+                demonBtn.style.display = 'none';
+            }
+
+            const videoBtn = document.getElementById('completion-modal-video');
+            if (videoUrl) {
+                videoBtn.href = videoUrl;
+                videoBtn.style.display = 'inline-flex';
+            } else {
+                videoBtn.removeAttribute('href');
+                videoBtn.style.display = 'none';
+            }
+
+            overlay.classList.add('visible');
+            overlay.setAttribute('aria-hidden', 'false');
+        }
+
+        function closeCompletionModal() {
+            const overlay = document.getElementById('completion-modal-overlay');
+            overlay.classList.remove('visible');
+            overlay.setAttribute('aria-hidden', 'true');
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                closeCompletionModal();
+                closeBadgeModal();
+                closeModerationPanel();
+            }
+        });
+
+        document.addEventListener('click', (e) => {
+            const overlay = document.getElementById('completion-modal-overlay');
+            if (overlay && e.target === overlay) {
+                closeCompletionModal();
+                return;
+            }
+
+            if (e.target && e.target.closest && e.target.closest('#completion-modal-close')) {
+                closeCompletionModal();
+                return;
+            }
+        });
+
+        const completedContainer = document.getElementById('completed-levels');
+        if (completedContainer) {
+            completedContainer.addEventListener('click', (e) => {
+                const trigger = e.target.closest('[data-record-id]');
+                if (!trigger) return;
+
+                e.preventDefault();
+                const recordId = trigger.getAttribute('data-record-id');
+                const record = completedRecordsCache.find(r => String(r.record_id) === String(recordId));
+                if (record) {
+                    openCompletedLevelModal(record);
+                }
+            });
+        }
+
+        function openCompletedLevelModal(record) {
+            openCompletionModal({
+                name: record.name,
+                placement: getPlacementLabel(record.position),
+                status: getCompletionStatusLabel(record.completion_status),
+                videoUrl: record.video_url,
+                points: record.points,
+                enjoymentRating: record.enjoyment_rating,
+                demonUrl: record.demon_id ? `/demon/${record.demon_id}` : ''
+            });
+        }
+
+        function setCompletedSort(mode) {
+            completedSortMode = ['recent', 'difficult', 'alphabetical'].includes(mode) ? mode : 'recent';
+            renderCompletedLevels();
+        }
+
+        function setCompletedFilter(mode) {
+            completedFilterMode = ['all', 'verification', 'first-victor'].includes(mode) ? mode : 'all';
+            renderCompletedLevels();
+        }
+
+        function getSortedCompletedRecords(records) {
+            let list = Array.isArray(records) ? records.slice() : [];
+            if (completedFilterMode === 'verification') {
+                list = list.filter(record => Number.parseInt(record.completion_status, 10) === 0);
+            } else if (completedFilterMode === 'first-victor') {
+                list = list.filter(record => Number.parseInt(record.completion_status, 10) === 1);
+            }
+
+            if (completedSortMode === 'difficult') {
+                return list;
+            }
+
+            if (completedSortMode === 'alphabetical') {
+                return list.sort((a, b) => {
+                    const aName = String(a.name || '').toLowerCase();
+                    const bName = String(b.name || '').toLowerCase();
+                    return aName.localeCompare(bName, undefined, { sensitivity: 'base' });
+                });
+            }
+
+            return list.sort((a, b) => {
+                const aId = parseInt(a.record_id, 10) || 0;
+                const bId = parseInt(b.record_id, 10) || 0;
+                return bId - aId;
+            });
+        }
+
+        function renderCompletedLevels() {
+            const completedContainer = document.getElementById('completed-levels');
+            if (!completedContainer) return;
+
+            const completed = getSortedCompletedRecords(completedRecordsCache);
+
+            if (completed.length === 0) {
+                completedContainer.innerHTML = "<div class='section-empty'>No completed levels yet.</div>";
+                return;
+            }
+
+            completedContainer.innerHTML = completed.map((r, idx) => {
+                const tier = getTier(r.position);
+                const tierClass = tier === 'main' ? 'tier-main' : tier === 'extended' ? 'tier-extended' : 'tier-legacy';
+                const safeName = escapeHtml(r.name);
+                const safeRecordId = escapeHtml(r.record_id);
+
+                return `
+                    <button type="button" data-record-id="${safeRecordId}" class="completed-link clickable-completion ${tierClass}">
+                        ${safeName}
+                    </button>${idx < completed.length - 1 ? '<span class="comma"> - </span>' : ''}
+                `;
+            }).join('');
+        }
+
+        const hardestEl = document.getElementById('current-hardest');
+        if (hardestEl) {
+            hardestEl.addEventListener('click', () => {
+                if (hardestRecordCache) {
+                    openCompletedLevelModal(hardestRecordCache);
+                }
+            });
+        }
+
+        function renderProfileBadges(groups) {
+            const section = document.getElementById('profile-badges-section');
+            const grid = document.getElementById('profile-badges-grid');
+            const unlocked = Array.isArray(groups) ? groups.filter(group => group.unlocked) : [];
+            const isOwner = Array.isArray(currentProfileData?.badgeCatalog);
+
+            if (!unlocked.length && !isOwner) {
+                section.style.display = 'none';
+                grid.innerHTML = '';
+                return;
+            }
+
+            const badgeButtons = unlocked.map(group => {
+                const tier = group.currentTier || {};
+                const tooltip = [tier.name, tier.description].filter(Boolean).join(' — ');
+                return `
+                    <button type="button" class="profile-badge-button" onclick="openBadgeModal('${escapeHtml(group.id)}')" title="${escapeHtml(tooltip)}" aria-label="${escapeHtml(tier.name || 'Badge')}">
+                        <img src="${escapeHtml(tier.iconPath || group.iconPath || '/assets/icon.png')}" alt="">
+                    </button>
+                `;
+            }).join('');
+
+            const addButton = isOwner
+                ? '<button type="button" class="profile-badge-add-button" onclick="openBadgeGrantModal()" title="Add badge" aria-label="Add badge">+</button>'
+                : '';
+
+            grid.innerHTML = badgeButtons + addButton;
+            section.style.display = 'block';
+        }
+
+        function openBadgeModal(groupId) {
+            const group = (currentProfileData?.badges || []).find(item => item.id === groupId);
+            const tier = group?.currentTier;
+            if (!tier) return;
+
+            document.getElementById('badge-modal-icon').src = tier.iconPath || group.iconPath || '/assets/icon.png';
+            document.getElementById('badge-modal-name').innerText = tier.name || 'Badge';
+            document.getElementById('badge-modal-description').innerText = tier.description || '';
+
+            const overlay = document.getElementById('badge-modal-overlay');
+            overlay.classList.add('visible');
+            overlay.setAttribute('aria-hidden', 'false');
+        }
+
+        function closeBadgeModal() {
+            const overlay = document.getElementById('badge-modal-overlay');
+            overlay.classList.remove('visible');
+            overlay.setAttribute('aria-hidden', 'true');
+        }
+
+        function openBadgeGrantModal() {
+            const catalog = Array.isArray(currentProfileData?.badgeCatalog) ? currentProfileData.badgeCatalog : [];
+            const select = document.getElementById('badge-grant-select');
+            const options = [];
+
+            for (const group of catalog) {
+                for (const tier of Array.isArray(group.tiers) ? group.tiers : []) {
+                    const label = tier.name || `Badge ${tier.id}`;
+                    options.push(`<option value="${escapeHtml(group.id)}:${Number(tier.id)}">${escapeHtml(label)}</option>`);
+                }
+            }
+
+            select.innerHTML = options.join('');
+            if (!options.length) {
+                alert('No badges are configured.');
+                return;
+            }
+
+            const overlay = document.getElementById('badge-grant-modal-overlay');
+            overlay.classList.add('visible');
+            overlay.setAttribute('aria-hidden', 'false');
+        }
+
+        function closeBadgeGrantModal() {
+            const overlay = document.getElementById('badge-grant-modal-overlay');
+            overlay.classList.remove('visible');
+            overlay.setAttribute('aria-hidden', 'true');
+        }
+
+        async function grantSelectedBadge() {
+            const value = document.getElementById('badge-grant-select').value;
+            const splitAt = value.lastIndexOf(':');
+            const groupId = value.slice(0, splitAt);
+            const tierId = Number(value.slice(splitAt + 1));
+            if (!groupId || !Number.isInteger(tierId)) return;
+
+            try {
+                const res = await fetch(`/api/owner/users/${currentProfileData.userId}/badges`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ groupId, tierId })
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error || 'Could not add badge.');
+                alert(data.message || 'Badge added.');
+                closeBadgeGrantModal();
+                await loadProfile();
+            } catch (err) {
+                alert(err.message);
+            }
+        }
+
+        function setupModerationButton(data) {
+            const button = document.getElementById('moderator-profile-button');
+            const viewerRole = String(data.moderation?.viewerRole || '').toLowerCase();
+            const targetRole = String(data.role || '').toLowerCase();
+            const targetIsStaff = ['moderator', 'admin', 'owner'].includes(targetRole);
+            const canModerate = Boolean(data.moderation?.canModerate)
+                && (viewerRole === 'owner' || !targetIsStaff);
+            button.style.display = canModerate ? 'inline-flex' : 'none';
+        }
+
+        function closeModerationPanel() {
+            pendingModerationAction = null;
+            const overlay = document.getElementById('moderation-modal-overlay');
+            overlay.classList.remove('visible');
+            overlay.setAttribute('aria-hidden', 'true');
+        }
+
+        async function openModerationPanel() {
+            if (!currentProfileData?.userId) return;
+            pendingModerationAction = null;
+            const overlay = document.getElementById('moderation-modal-overlay');
+            const content = document.getElementById('moderation-modal-content');
+            overlay.classList.add('visible');
+            overlay.setAttribute('aria-hidden', 'false');
+            content.innerHTML = '<p style="color:var(--text-muted);">Loading...</p>';
+
+            try {
+                const res = await fetch(`/api/moderation/users/${currentProfileData.userId}`);
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || 'Could not load moderation controls.');
+                moderationPanelData = data;
+                renderModerationPanel(data);
+            } catch (err) {
+                content.innerHTML = `<p style="color:var(--danger);">${escapeHtml(err.message)}</p>`;
+            }
+        }
+
+        function renderModerationPanel(data) {
+            const content = document.getElementById('moderation-modal-content');
+            const target = data.target || {};
+            const viewerRole = String(data.viewerRole || '').toLowerCase();
+            const targetRole = String(target.role || 'user').toLowerCase();
+            const isAdminViewer = ['admin', 'owner'].includes(viewerRole);
+            const isOwnerViewer = viewerRole === 'owner';
+            const protectedTarget = Boolean(target.protectedFromBans);
+            const normalizedTargetRole = targetRole === 'user' ? 'member' : targetRole;
+            const targetIsStaff = ['moderator', 'admin', 'owner'].includes(normalizedTargetRole);
+
+            if (targetIsStaff && !isOwnerViewer) {
+                content.innerHTML = '<p style="color:var(--danger);">Only the owner can moderate staff members.</p>';
+                return;
+            }
+
+            content.innerHTML = `
+                <div id="staff-action-options">
+                    <div class="staff-control-section">
+                        ${protectedTarget
+                            ? '<p style="color:var(--text-muted);">You cannot ban this person.</p>'
+                            : `<div class="staff-action-row"><button type="button" class="${target.leaderboard_banned ? '' : 'danger'}" onclick="beginModerationAction('leaderboard-ban', ${target.leaderboard_banned ? 'false' : 'true'}, '${target.leaderboard_banned ? 'Remove leaderboard ban' : 'Leaderboard ban'}')">${target.leaderboard_banned ? 'Remove leaderboard ban' : 'Leaderboard ban'}</button></div>`}
+                        ${isAdminViewer ? `
+                            ${protectedTarget
+                                ? ''
+                                : `<br><div class="staff-action-row"><button type="button" class="${target.account_disabled ? '' : 'danger'}" onclick="beginModerationAction('account-disabled', ${target.account_disabled ? 'false' : 'true'}, '${target.account_disabled ? 'Re-enable account' : 'Disable account'}')">${target.account_disabled ? 'Re-enable account' : 'Disable account'}</button></div>`}
+                            ${isOwnerViewer && target.account_disabled && !protectedTarget
+                                ? `<br><div class="staff-action-row"><button type="button" class="danger" onclick="beginModerationAction('reset-account', true, 'Reset account')">Reset account</button></div>`
+                                : ''}
+                        ` : ''}
+                    </div>
+                    ${isAdminViewer ? `
+                        ${isOwnerViewer && normalizedTargetRole !== 'owner' ? `
+                            <div class="staff-control-section">
+                                <h5>Change role</h5>
+                                <select id="staff-role-select" aria-label="User role">
+                                    <option value="member" ${normalizedTargetRole === 'member' ? 'selected' : ''}>Member</option>
+                                    <option value="moderator" ${normalizedTargetRole === 'moderator' ? 'selected' : ''}>Moderator</option>
+                                    <option value="admin" ${normalizedTargetRole === 'admin' ? 'selected' : ''}>Admin</option>
+                                </select>
+                                <div class="staff-action-row">
+                                    <button type="button" onclick="beginModerationAction('role', document.getElementById('staff-role-select').value, 'Change role')">Change role</button>
+                                </div>
+                            </div>
+                        ` : ''}
+                        <div class="staff-control-section">
+                            <h5>Moderate username</h5>
+                            <input id="staff-username" type="text" value="${escapeHtml(target.username || '')}" maxlength="20">
+                            <div class="staff-action-row"><button type="button" onclick="beginModerationAction('username', null, 'Change username')">Change username</button></div>
+                        </div>
+                    ` : ''}
+                </div>
+                <div class="staff-control-section" id="staff-reason-section" hidden>
+                    <h5>Reason for account action</h5>
+                    <textarea id="staff-global-reason" rows="3" placeholder="Reason for action (optional)"></textarea>
+                    <div class="staff-action-row">
+                        <button id="staff-confirm-action" type="button" onclick="confirmModerationAction()">Confirm action</button>
+                        <button type="button" onclick="cancelModerationAction()">Cancel</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function beginModerationAction(type, value, label) {
+            if (type === 'reset-account') {
+                const confirmed = window.confirm('Reset this account? This permanently removes all of its data.');
+                if (!confirmed) return;
+                pendingModerationAction = { type, value };
+                confirmModerationAction();
+                return;
+            }
+
+            pendingModerationAction = { type, value };
+            const section = document.getElementById('staff-reason-section');
+            const reason = document.getElementById('staff-global-reason');
+            const confirmButton = document.getElementById('staff-confirm-action');
+            if (!section || !reason || !confirmButton) return;
+
+            const options = document.getElementById('staff-action-options');
+            if (options) options.hidden = true;
+            section.hidden = false;
+            reason.value = '';
+            confirmButton.textContent = `Confirm ${label}`;
+            reason.focus({ preventScroll: true });
+        }
+
+        function cancelModerationAction() {
+            pendingModerationAction = null;
+            const section = document.getElementById('staff-reason-section');
+            const options = document.getElementById('staff-action-options');
+            const reason = document.getElementById('staff-global-reason');
+            if (reason) reason.value = '';
+            if (section) section.hidden = true;
+            if (options) options.hidden = false;
+        }
+
+        function moderationReason() {
+            return document.getElementById('staff-global-reason')?.value.trim() || '';
+        }
+
+        async function runModerationRequest(url, options) {
+            const res = await fetch(url, options);
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.error || 'Moderation action failed.');
+            alert(data.message || 'Action completed.');
+            return data;
+        }
+
+        async function confirmModerationAction() {
+            if (!pendingModerationAction) return;
+            const action = pendingModerationAction;
+            const confirmButton = document.getElementById('staff-confirm-action');
+            if (confirmButton) confirmButton.disabled = true;
+
+            try {
+                if (action.type === 'leaderboard-ban') {
+                    await setLeaderboardBan(Boolean(action.value));
+                } else if (action.type === 'account-disabled') {
+                    await setAccountDisabled(Boolean(action.value));
+                } else if (action.type === 'username') {
+                    await saveModeratedUsername();
+                } else if (action.type === 'role') {
+                    await changeUserRole(String(action.value || ''));
+                } else if (action.type === 'reset-account') {
+                    await resetAccount();
+                }
+            } catch (err) {
+                alert(err.message);
+                if (confirmButton?.isConnected) confirmButton.disabled = false;
+            }
+        }
+
+        async function setLeaderboardBan(banned) {
+            await runModerationRequest(`/api/moderation/users/${currentProfileData.userId}/leaderboard-ban`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ banned, reason: moderationReason() })
+            });
+            await openModerationPanel();
+            await loadProfile();
+        }
+
+        async function setAccountDisabled(disabled) {
+            await runModerationRequest(`/api/admin/users/${currentProfileData.userId}/disable`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ disabled, reason: moderationReason() })
+            });
+            await openModerationPanel();
+            await loadProfile();
+        }
+
+        async function resetAccount() {
+            const data = await runModerationRequest(`/api/owner/users/${currentProfileData.userId}/reset`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({})
+            });
+            if (data.username) {
+                window.location.href = `/profile?user=${encodeURIComponent(data.username)}`;
+            }
+        }
+
+        async function saveModeratedUsername() {
+            const username = document.getElementById('staff-username').value.trim();
+            await runModerationRequest(`/api/admin/users/${currentProfileData.userId}/username`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, reason: moderationReason() })
+            });
+            window.location.href = `/profile?user=${encodeURIComponent(username)}`;
+        }
+
+        async function changeUserRole(role) {
+            await runModerationRequest(`/api/owner/users/${currentProfileData.userId}/role`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ role, reason: moderationReason() })
+            });
+            await openModerationPanel();
+            await loadProfile();
+        }
+
+
+        document.addEventListener('click', event => {
+            const badgeOverlay = document.getElementById('badge-modal-overlay');
+            const badgeGrantOverlay = document.getElementById('badge-grant-modal-overlay');
+            const moderationOverlay = document.getElementById('moderation-modal-overlay');
+            if (event.target === badgeOverlay) closeBadgeModal();
+            if (event.target === badgeGrantOverlay) closeBadgeGrantModal();
+            if (event.target === moderationOverlay) closeModerationPanel();
+        });
+
+        async function loadProfile() {
+            const params = new URLSearchParams(window.location.search);
+            const username = params.get('user');
+
+            if (!username) {
+                window.location.href = "/";
+                return;
+            }
+
+            try {
+                const res = await fetch(`/api/profile/${username}`);
+                if (res.status === 404) {
+                    document.getElementById('error-display').style.display = 'block';
+                    return;
+                }
+
+                const data = await res.json();
+                currentProfileData = data;
+                renderProfileBadges(data.badges || []);
+                setupModerationButton(data);
+                document.getElementById('profile-display').style.display = 'block';
+
+                if (isImpossibleList) {
+                    document.getElementById('completed-section').style.display = 'none';
+                    document.getElementById('completions-stat').style.display = 'none';
+                    document.getElementById('hardest-stat').style.display = 'none';
+                }
+
+                const lbTag = document.getElementById('leaderboard-tag');
+                const lbIcon = document.getElementById('trophy-icon');
+                const lbRankText = document.getElementById('leaderboard-rank');
+
+                const rank = parseInt(data.leaderboardRank, 10);
+                const totalPoints = parseFloat(data.totalPoints);
+
+                if (totalPoints > 0 && rank > 0) {
+                    lbTag.style.display = 'flex';
+                    lbRankText.innerText = `#${rank}`;
+
+                    let iconPath = '/assets/trophies/topEveryone.png';
+                    if (rank === 1) iconPath = '/assets/trophies/top1.png';
+                    else if (rank === 2) iconPath = '/assets/trophies/top2.png';
+                    else if (rank === 3) iconPath = '/assets/trophies/top3.png';
+                    else if (rank <= 10) iconPath = '/assets/trophies/top10.png';
+                    else if (rank <= 25) iconPath = '/assets/trophies/top25.png';
+                    else if (rank <= 100) iconPath = '/assets/trophies/top100.png';
+
+                    lbIcon.src = iconPath;
+                } else {
+                    lbTag.style.display = 'none';
+                }
+
+                const nameEl = document.getElementById('user-name');
+                const badgeEl = document.getElementById('role-badge');
+                const headerBox = document.getElementById('header-box');
+
+                const displayName = String(data.displayName || '').trim();
+                nameEl.innerText = displayName || data.username;
+                renderProfileIcon(data);
+                renderProfileExtras(data);
+
+                if (data.role === 'owner') {
+                    nameEl.style.color = '#00e676';
+                    badgeEl.src = '/assets/owner.png';
+                    badgeEl.style.display = 'block';
+                } else if (data.role === 'admin') {
+                    nameEl.style.color = '#55acee';
+                    badgeEl.src = '/assets/eldermoderator.png';
+                    badgeEl.style.display = 'block';
+                } else if (data.role === 'moderator') {
+                    nameEl.style.color = '#ff4444';
+                    badgeEl.src = '/assets/moderator.png';
+                    badgeEl.style.display = 'block';
+                } else {
+                    nameEl.style.color = 'white';
+                    badgeEl.style.display = 'none';
+                }
+
+                document.getElementById('user-id-display').innerText = displayName
+                    ? `@${data.username} • ID: ${data.userId || 'N/A'}`
+                    : `ID: ${data.userId || 'N/A'}`;
+                document.getElementById('total-points').innerText = data.totalPoints;
+
+                const records = Array.isArray(data.records) ? data.records : [];
+                const hardestRecord = getHardestRecord(records);
+                hardestRecordCache = hardestRecord;
+
+                const hardestButton = document.getElementById('current-hardest');
+                if (hardestRecord) {
+                    hardestButton.innerText = hardestRecord.name;
+                    hardestButton.disabled = false;
+                } else {
+                    hardestButton.innerText = 'N/A';
+                    hardestButton.disabled = true;
+                }
+
+                const completed = records.filter(r => parseInt(r.percentage, 10) === 100);
+
+                completedRecordsCache = completed;
+                completedSortMode = 'recent';
+                completedFilterMode = 'all';
+                const sortSelect = document.getElementById('completed-sort');
+                if (sortSelect) sortSelect.value = completedSortMode;
+                const filterSelect = document.getElementById('completed-filter');
+                if (filterSelect) filterSelect.value = completedFilterMode;
+
+                const completedListWorthy = completed.filter(r => parseInt(r.position, 10) <= 150);
+                const progress = records.filter(r => parseInt(r.percentage, 10) !== 100);
+
+                document.getElementById('demon-count').innerText = completedListWorthy.length;
+
+                const mainCount = completed.filter(r => getTier(r.position) === 'main').length;
+                const extendedCount = completed.filter(r => getTier(r.position) === 'extended').length;
+                const legacyCount = completed.filter(r => getTier(r.position) === 'legacy').length;
+
+                document.getElementById('info-main-count').innerText = mainCount;
+                document.getElementById('info-extended-count').innerText = extendedCount;
+                document.getElementById('info-legacy-count').innerText = legacyCount;
+                document.getElementById('info-joined').innerText = formatJoinedDate(data.joined);
+
+                renderCompletedLevels();
+
+                const progressContainer = document.getElementById('progress-list');
+                if (progress.length === 0) {
+                    progressContainer.innerHTML = "<div class='section-empty'>No progress records.</div>";
+                } else {
+                    progressContainer.innerHTML = progress.map(r => {
+                        const is100 = parseInt(r.percentage, 10) === 100;
+                        let textPercColor = "";
+
+                        if (is100) {
+                            textPercColor = isImpossibleList ? "#ff4444" : "#00e676";
+                        } else {
+                            textPercColor = isImpossibleList ? "#ff6666" : "#ffaa00";
+                        }
+
+                        const borderClass = is100 ? 'completion' : (isImpossibleList ? '' : 'progress');
+
+                        return `
+                            <div class="record-card ${borderClass}">
+                                <div>
+                                    <span class="rank-tag">#${r.position}</span>
+                                    <a href="/demon/${r.demon_id}" class="level-link">
+                                        <span class="b">${escapeHtml(r.name)}</span>
+                                    </a>
+                                    <span style="color: ${textPercColor}; font-size: 0.9em;">
+                                        (${r.percentage}%)
+                                    </span>
+                                </div>
+                                <div style="display: flex; align-items: center; gap: 20px;">
+                                    <span class="points-tag">${r.points} pts</span>
+                                    <a href="${escapeHtml(r.video_url)}" target="_blank" rel="noopener"
+                                       style="color: var(--text-muted); text-decoration: none; font-size: 0.85em; border: 1px solid var(--border); padding: 6px 12px; border-radius: var(--radius-sm);">
+                                         Watch
+                                    </a>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                }
+
+            } catch (err) {
+                console.error("Failed to load profile:", err);
+            }
+        }
+
+        loadProfile();
+    </script>
+</body>
+</html>
