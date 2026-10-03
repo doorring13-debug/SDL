@@ -1,0 +1,7631 @@
+const express = require('express');
+const { Pool } = require('pg');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const dns = require('dns');
+const net = require('net');
+const http = require('http');
+const https = require('https');
+const axios = require('axios');
+const { randomBytes, randomInt, createHash, createHmac, createCipheriv, createDecipheriv, timingSafeEqual } = require('crypto');
+const ffmpeg = require('fluent-ffmpeg');
+let bundledFfmpegPath = null;
+try { bundledFfmpegPath = require('ffmpeg-static'); } catch (_) {}
+const resolvedFfmpegPath = process.env.FFMPEG_PATH || bundledFfmpegPath;
+if (resolvedFfmpegPath) ffmpeg.setFfmpegPath(resolvedFfmpegPath);
+require('dotenv').config();
+const app = express();
+app.use(cors({
+    origin: ['https://webdemonlist.org', 'https://impossible.webdemonlist.org'],
+    credentials: true
+}));
+app.use(express.json());
+app.use(express.static('public'));
+
+app.use((req, res, next) => {
+    const host = req.headers.host || '';
+    if (host.startsWith('impossible.')) {
+        req.currentList = 'impossible';
+    } else {
+        req.currentList = 'main';
+    }
+    next();
+});
+
+const { Resend } = require('resend');
+const QRCode = require('qrcode');
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+const databaseUrl = String(process.env.DATABASE_URL || '').trim();
+const pool = new Pool({
+  connectionString: databaseUrl || undefined,
+  ssl: databaseUrl ? { rejectUnauthorized: false } : undefined
+});
+
+// Lightweight health endpoint so deployment problems are immediately visible.
+app.get('/api/health', async (req, res) => {
+    if (!databaseUrl) {
+        return res.status(503).json({
+            ok: false,
+            database: false,
+            error: 'DATABASE_URL is not configured.'
+        });
+    }
+    try {
+        await pool.query('SELECT 1');
+        res.json({ ok: true, database: true });
+    } catch (err) {
+        console.error('Health check database error:', err.message);
+        res.status(503).json({ ok: false, database: false, error: 'Database connection failed.' });
+    }
+});
+
+
+const TWO_FACTOR_CODE_TTL_MS = 10 * 60 * 1000;
+const TWO_FACTOR_RESEND_COOLDOWN_MS = 45 * 1000;
+const TWO_FACTOR_MAX_ATTEMPTS = 8;
+const TWO_FACTOR_TOTP_PERIOD_SECONDS = 30;
+const TWO_FACTOR_TOTP_DIGITS = 6;
+
+function normalizeTwoFactorCode(value) {
+    return String(value || '').replace(/\s+/g, '');
+}
+
+function generateEmailTwoFactorCode() {
+    return String(randomInt(0, 1000000)).padStart(6, '0');
+}
+
+function hashTwoFactorCode(code, userId, purpose) {
+    const pepper = process.env.SESSION_SECRET || 'wbdl-two-factor';
+    return createHash('sha256')
+        .update(`${normalizeTwoFactorCode(code)}:${Number(userId)}:${String(purpose || '')}:${pepper}`)
+        .digest('hex');
+}
+
+function safeEqualText(a, b) {
+    const left = Buffer.from(String(a || ''), 'utf8');
+    const right = Buffer.from(String(b || ''), 'utf8');
+    return left.length === right.length && timingSafeEqual(left, right);
+}
+
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+function base32Encode(buffer) {
+    let bits = 0;
+    let value = 0;
+    let output = '';
+    for (const byte of buffer) {
+        value = (value << 8) | byte;
+        bits += 8;
+        while (bits >= 5) {
+            output += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+            bits -= 5;
+        }
+    }
+    if (bits > 0) output += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+    return output;
+}
+
+function base32Decode(value) {
+    const clean = String(value || '').toUpperCase().replace(/[^A-Z2-7]/g, '');
+    let bits = 0;
+    let accumulator = 0;
+    const bytes = [];
+    for (const char of clean) {
+        const index = BASE32_ALPHABET.indexOf(char);
+        if (index < 0) throw new Error('Invalid authenticator secret.');
+        accumulator = (accumulator << 5) | index;
+        bits += 5;
+        if (bits >= 8) {
+            bytes.push((accumulator >>> (bits - 8)) & 0xff);
+            bits -= 8;
+        }
+    }
+    return Buffer.from(bytes);
+}
+
+function makeTotpSecret() {
+    return base32Encode(randomBytes(20));
+}
+
+function generateTotpCode(secret, counter) {
+    const key = base32Decode(secret);
+    const counterBuffer = Buffer.alloc(8);
+    counterBuffer.writeBigUInt64BE(BigInt(counter));
+    const digest = createHmac('sha1', key).update(counterBuffer).digest();
+    const offset = digest[digest.length - 1] & 0x0f;
+    const binary = ((digest[offset] & 0x7f) << 24)
+        | ((digest[offset + 1] & 0xff) << 16)
+        | ((digest[offset + 2] & 0xff) << 8)
+        | (digest[offset + 3] & 0xff);
+    return String(binary % (10 ** TWO_FACTOR_TOTP_DIGITS)).padStart(TWO_FACTOR_TOTP_DIGITS, '0');
+}
+
+function verifyTotpCode(secret, candidate, nowMs = Date.now()) {
+    const code = normalizeTwoFactorCode(candidate);
+    if (!/^\d{6}$/.test(code)) return false;
+    const counter = Math.floor(nowMs / 1000 / TWO_FACTOR_TOTP_PERIOD_SECONDS);
+    for (const offset of [-1, 0, 1]) {
+        const expected = generateTotpCode(secret, counter + offset);
+        if (safeEqualText(expected, code)) return true;
+    }
+    return false;
+}
+
+function getTwoFactorEncryptionKey() {
+    const source = process.env.TWO_FACTOR_ENCRYPTION_KEY || process.env.SESSION_SECRET;
+    if (!source) throw new Error('TWO_FACTOR_ENCRYPTION_KEY or SESSION_SECRET must be configured.');
+    return createHash('sha256').update(String(source)).digest();
+}
+
+function encryptTwoFactorSecret(secret) {
+    const iv = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', getTwoFactorEncryptionKey(), iv);
+    const ciphertext = Buffer.concat([cipher.update(String(secret), 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return `v1:${iv.toString('base64')}:${tag.toString('base64')}:${ciphertext.toString('base64')}`;
+}
+
+function decryptTwoFactorSecret(value) {
+    const parts = String(value || '').split(':');
+    if (parts.length !== 4 || parts[0] !== 'v1') throw new Error('Invalid stored authenticator secret.');
+    const iv = Buffer.from(parts[1], 'base64');
+    const tag = Buffer.from(parts[2], 'base64');
+    const ciphertext = Buffer.from(parts[3], 'base64');
+    const decipher = createDecipheriv('aes-256-gcm', getTwoFactorEncryptionKey(), iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+}
+
+function maskEmailAddress(email) {
+    const [local = '', domain = ''] = String(email || '').split('@');
+    if (!local || !domain) return 'your email address';
+    const visible = local.slice(0, Math.min(2, local.length));
+    return `${visible}${'*'.repeat(Math.max(3, local.length - visible.length))}@${domain}`;
+}
+
+function clearTwoFactorLoginChallenge(req) {
+    if (req.session) req.session.twoFactorLogin = null;
+}
+
+function clearTwoFactorSettingsChallenge(req) {
+    if (req.session) req.session.twoFactorSettings = null;
+}
+
+function getStoredTwoFactorMethods(value) {
+    const method = String(value || '').toLowerCase();
+    if (method === 'both') return ['email', 'app'];
+    if (method === 'email' || method === 'app') return [method];
+    return [];
+}
+
+function hasStoredTwoFactorMethod(value, method) {
+    return getStoredTwoFactorMethods(value).includes(String(method || '').toLowerCase());
+}
+
+function hasAnyStoredTwoFactorMethod(value) {
+    return getStoredTwoFactorMethods(value).length > 0;
+}
+
+async function sendTwoFactorCodeEmail(targetEmail, username, code, context = 'login') {
+    const title = context === 'setup'
+        ? 'Confirm 2FA setup'
+        : context === 'disable'
+            ? 'Confirm 2FA change'
+            : context === 'account-action'
+                ? 'Confirm your WBDL account action'
+                : 'Your WBDL login code';
+    const description = context === 'setup'
+        ? 'Use this code to finish enabling 2FA on your WBDL account.'
+        : context === 'disable'
+            ? 'Use this code to confirm this 2FA change on your WBDL account.'
+            : context === 'account-action'
+                ? 'Use this code to confirm the sensitive account change you just requested.'
+                : 'Use this code to finish signing in to your WBDL account.';
+
+    await resend.emails.send({
+        from: 'Web Browser Demonlist <support@webdemonlist.org>',
+        to: targetEmail,
+        subject: title,
+        html: `
+        <div style="font-family: Nunito, Arial, sans-serif; background-color: #181b1e; color: #f2f3f5; padding: 40px; border-radius: 12px; max-width: 600px; margin: auto; border: 1px solid #2a2f36;">
+            <h1 style="font-family: Comfortaa, Arial, sans-serif; color: #00e676; text-align: center; margin: 0 0 22px; font-size: 26px; line-height: 1.2;">${title}</h1>
+            <p style="text-align: center; color: #8b929c; font-size: 16px; line-height: 1.6; margin: 0;">Hello ${username}, ${description}</p>
+            <div style="font-family: monospace; letter-spacing: 8px; font-size: 34px; font-weight: 800; text-align: center; margin: 30px 0; color: #f2f3f5;">${code}</div>
+            <p style="font-size: 12px; color: #5a616b; text-align: center; margin: 0;">This code expires in 10 minutes. If you did not request it, you can ignore this email.</p>
+        </div>`
+    });
+}
+
+function buildAuthenticatorUri(username, secret) {
+    const issuer = 'WBDL';
+    const label = `WBDL:${String(username || 'user')}`;
+    return `otpauth://totp/${encodeURIComponent(label)}?secret=${encodeURIComponent(secret)}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
+}
+
+const BANNER_PREVIEW_MAX_BYTES = 200 * 1024 * 1024;
+const BANNER_PREVIEW_DOWNLOAD_TIMEOUT_MS = 25000;
+const BANNER_PREVIEW_FFMPEG_TIMEOUT_MS = 25000;
+const bannerPreviewJobs = new Map();
+
+
+function hasPngSignature(buffer) {
+    return Buffer.isBuffer(buffer)
+        && buffer.length >= 8
+        && buffer[0] === 0x89
+        && buffer[1] === 0x50
+        && buffer[2] === 0x4E
+        && buffer[3] === 0x47
+        && buffer[4] === 0x0D
+        && buffer[5] === 0x0A
+        && buffer[6] === 0x1A
+        && buffer[7] === 0x0A;
+}
+
+function isPublicBannerIp(address) {
+    const family = net.isIP(address);
+    if (!family) return false;
+    if (family === 4) {
+        const parts = address.split('.').map(Number);
+        const [a, b, c] = parts;
+        if (a === 0 || a === 10 || a === 127) return false;
+        if (a === 100 && b >= 64 && b <= 127) return false;
+        if (a === 169 && b === 254) return false;
+        if (a === 172 && b >= 16 && b <= 31) return false;
+        if (a === 192 && b === 168) return false;
+        if (a === 192 && b === 0 && c === 0) return false;
+        if (a === 192 && b === 0 && c === 2) return false;
+        if (a === 198 && (b === 18 || b === 19)) return false;
+        if (a === 198 && b === 51 && c === 100) return false;
+        if (a === 203 && b === 0 && c === 113) return false;
+        if (a >= 224) return false;
+        return true;
+    }
+    const normalized = address.toLowerCase().split('%')[0];
+    if (normalized === '::' || normalized === '::1') return false;
+    if (normalized.startsWith('fc') || normalized.startsWith('fd')) return false;
+    if (/^fe[89ab]/.test(normalized)) return false;
+    if (normalized.startsWith('ff') || normalized.startsWith('2001:db8:')) return false;
+    if (normalized.startsWith('::ffff:')) return isPublicBannerIp(normalized.slice(7));
+    return true;
+}
+
+function safeBannerLookup(hostname, options, callback) {
+    dns.lookup(hostname, { all: true, verbatim: true }, (err, addresses) => {
+        if (err) return callback(err);
+        const safe = (addresses || []).find(entry => isPublicBannerIp(entry.address));
+        if (!safe) return callback(new Error('Banner host does not resolve to a public address.'));
+        if (options && options.all) return callback(null, [safe]);
+        callback(null, safe.address, safe.family);
+    });
+}
+
+const bannerHttpAgent = new http.Agent({ keepAlive: true, lookup: safeBannerLookup });
+const bannerHttpsAgent = new https.Agent({ keepAlive: true, lookup: safeBannerLookup });
+
+function validateBannerMediaUrl(value) {
+    const parsed = new URL(String(value || '').trim());
+    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Banner URL must use HTTP or HTTPS.');
+    if (parsed.username || parsed.password) throw new Error('Banner URL credentials are not allowed.');
+    if (net.isIP(parsed.hostname) && !isPublicBannerIp(parsed.hostname)) throw new Error('Banner URL must use a public host.');
+    return parsed.toString();
+}
+
+function validateBannerRedirect(options) {
+    const hostname = String(options?.hostname || options?.host || '').replace(/^\[|\]$/g, '');
+    if (hostname && net.isIP(hostname) && !isPublicBannerIp(hostname)) {
+        throw new Error('Banner redirect points to a non-public host.');
+    }
+}
+
+async function downloadBannerVideoToTemp(rawUrl) {
+    const bannerUrl = validateBannerMediaUrl(rawUrl);
+    const inputPath = path.join(os.tmpdir(), `wbdl-banner-${randomBytes(12).toString('hex')}.bin`);
+    const response = await axios.get(bannerUrl, {
+        responseType: 'stream',
+        timeout: BANNER_PREVIEW_DOWNLOAD_TIMEOUT_MS,
+        maxRedirects: 4,
+        maxContentLength: BANNER_PREVIEW_MAX_BYTES,
+        maxBodyLength: BANNER_PREVIEW_MAX_BYTES,
+        httpAgent: bannerHttpAgent,
+        httpsAgent: bannerHttpsAgent,
+        beforeRedirect: validateBannerRedirect,
+        headers: { 'User-Agent': 'WBDL-BannerPreview/1.0' },
+        validateStatus: status => status >= 200 && status < 300,
+    });
+
+    const contentLength = Number(response.headers['content-length'] || 0);
+    if (contentLength && contentLength > BANNER_PREVIEW_MAX_BYTES) {
+        response.data.destroy();
+        throw new Error('Banner video is too large to build a preview.');
+    }
+
+    try {
+        await new Promise((resolve, reject) => {
+            const output = fs.createWriteStream(inputPath, { flags: 'wx' });
+            let received = 0;
+            let settled = false;
+            const fail = err => {
+                if (settled) return;
+                settled = true;
+                response.data.destroy();
+                output.destroy();
+                reject(err);
+            };
+            response.data.on('data', chunk => {
+                received += chunk.length;
+                if (received > BANNER_PREVIEW_MAX_BYTES) fail(new Error('Banner video is too large to build a preview.'));
+            });
+            response.data.on('error', fail);
+            output.on('error', fail);
+            output.on('finish', () => {
+                if (settled) return;
+                settled = true;
+                resolve();
+            });
+            response.data.pipe(output);
+        });
+        return inputPath;
+    } catch (err) {
+        await fs.promises.unlink(inputPath).catch(() => {});
+        throw err;
+    }
+}
+
+async function extractBannerJpeg(inputPath, previewTimeSeconds = 0) {
+    const outputPath = path.join(os.tmpdir(), `wbdl-banner-frame-${randomBytes(12).toString('hex')}.jpg`);
+    try {
+        await new Promise((resolve, reject) => {
+            const safePreviewTime = Number.isFinite(Number(previewTimeSeconds)) && Number(previewTimeSeconds) >= 0
+                ? Number(previewTimeSeconds)
+                : 0;
+            const command = ffmpeg(inputPath)
+                .seekOutput(safePreviewTime)
+                .frames(1)
+                .size('1280x?')
+                .outputOptions('-q:v 5')
+                .output(outputPath);
+            let settled = false;
+            const timer = setTimeout(() => {
+                if (!settled) command.kill('SIGKILL');
+            }, BANNER_PREVIEW_FFMPEG_TIMEOUT_MS);
+            command.on('end', () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve();
+            });
+            command.on('error', err => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(err);
+            });
+            command.run();
+        });
+        return await fs.promises.readFile(outputPath);
+    } finally {
+        fs.promises.unlink(outputPath).catch(() => {});
+    }
+}
+
+async function captureBannerPreview(rawUrl, previewTimeSeconds = 0) {
+    const inputPath = await downloadBannerVideoToTemp(rawUrl);
+    try {
+        const handle = await fs.promises.open(inputPath, 'r');
+        try {
+            const signature = Buffer.alloc(8);
+            await handle.read(signature, 0, 8, 0);
+            if (hasPngSignature(signature)) {
+                throw new Error('PNG banners are not supported. Use an animated video banner.');
+            }
+        } finally {
+            await handle.close();
+        }
+
+        return await extractBannerJpeg(inputPath, previewTimeSeconds);
+    } finally {
+        fs.promises.unlink(inputPath).catch(() => {});
+    }
+}
+
+function runBannerPreviewJob(key, worker) {
+    if (bannerPreviewJobs.has(key)) return bannerPreviewJobs.get(key);
+    const job = Promise.resolve().then(worker).finally(() => bannerPreviewJobs.delete(key));
+    bannerPreviewJobs.set(key, job);
+    return job;
+}
+
+async function ensureBannerPreviewImage(demonId, list) {
+    const result = await pool.query(`
+        SELECT banner_url, banner_image, banner_image_source_url,
+               COALESCE(banner_preview_time, 0) AS banner_preview_time
+        FROM demons
+        WHERE id = $1 AND list_type = $2
+    `, [demonId, list]);
+    const row = result.rows[0];
+    if (!row?.banner_url) return null;
+    if (row.banner_image && row.banner_image_source_url === row.banner_url && !hasPngSignature(row.banner_image)) return row.banner_image;
+
+    const initialPreviewTime = Number(row.banner_preview_time) || 0;
+    return runBannerPreviewJob(`${list}:${demonId}:${initialPreviewTime}`, async () => {
+        const latestResult = await pool.query(`
+            SELECT banner_url, banner_image, banner_image_source_url,
+                   COALESCE(banner_preview_time, 0) AS banner_preview_time
+            FROM demons
+            WHERE id = $1 AND list_type = $2
+        `, [demonId, list]);
+        const latest = latestResult.rows[0];
+        if (!latest?.banner_url) return null;
+        if (latest.banner_image && latest.banner_image_source_url === latest.banner_url && !hasPngSignature(latest.banner_image)) return latest.banner_image;
+
+        const previewTime = Number(latest.banner_preview_time) || 0;
+        const image = await captureBannerPreview(latest.banner_url, previewTime);
+        const saved = await pool.query(`
+            UPDATE demons
+            SET banner_image = $1::bytea,
+                banner_image_source_url = $4::text,
+                banner_image_updated_at = NOW()
+            WHERE id = $2::integer
+              AND list_type = $3::text
+              AND banner_url = $4::text
+              AND COALESCE(banner_preview_time, 0) = $5::double precision
+            RETURNING banner_image
+        `, [image, demonId, list, latest.banner_url, previewTime]);
+        return saved.rows[0]?.banner_image || image;
+    });
+}
+
+const validateUsername = (username) => {
+    if (!username || username.length < 3 || username.length > 20) {
+        return "Username must be between 3 and 20 characters long.";
+    }
+    const usernameRegex = /^[a-zA-Z0-9._-]+$/;
+    if (!usernameRegex.test(username)) {
+        return "Usernames can only contain letters, numbers, underscores, dashes, and periods.";
+    }
+    return null;
+};
+
+const validateDisplayName = (displayName) => {
+    const value = String(displayName ?? '');
+    if (value.length > 30) {
+        return "Display name must be 30 characters or fewer.";
+    }
+    if (!/^[A-Za-z0-9 ._:;()<>*!?#-]*$/.test(value)) {
+        return "Display name uses disallowed characters.";
+    }
+    return null;
+};
+
+const validatePassword = (password) => {
+    if (!password || password.length < 6) {
+        return "Password must be at least 6 characters.";
+    }
+    return null;
+};
+
+const PROFILE_ICON_TYPES = new Set(['cube', 'ship', 'ball', 'ufo', 'wave', 'robot', 'spider', 'swing', 'jetpack']);
+const PROFILE_ICON_MAX_IDS = Object.freeze({
+    cube: 485,
+    ship: 169,
+    ball: 118,
+    ufo: 149,
+    wave: 96,
+    robot: 68,
+    spider: 69,
+    swing: 43,
+    jetpack: 8,
+});
+
+const validateProfileIcon = (icon = {}) => {
+    const type = String(icon.type || '');
+    const rawId = String(icon.id ?? '');
+    if (!PROFILE_ICON_TYPES.has(type) || !/^\d+$/.test(rawId)) {
+        return "Invalid icon selection.";
+    }
+
+    const id = Number(rawId);
+    const maxId = PROFILE_ICON_MAX_IDS[type];
+    if (!Number.isSafeInteger(id) || id < 1 || id > maxId) {
+        return "Invalid icon selection.";
+    }
+    return null;
+};
+
+const cleanProfileText = (value, maxLength) => {
+    const text = String(value ?? '').trim();
+    return text.length > maxLength ? text.slice(0, maxLength) : text;
+};
+
+const readProfileInt = (value, fallback) => {
+    const parsed = parseInt(value, 10);
+    return Number.isNaN(parsed) ? fallback : parsed;
+};
+
+const cleanProfileIcon = (icon = {}) => {
+    const type = PROFILE_ICON_TYPES.has(icon.type) ? icon.type : 'cube';
+    const parsedId = parseInt(icon.id, 10);
+    const parsedColor1 = parseInt(icon.color1, 10);
+    const parsedColor2 = parseInt(icon.color2, 10);
+    const parsedGlow = parseInt(icon.glow, 10);
+
+    const id = Number.isNaN(parsedId) ? 1 : Math.min(999, Math.max(1, parsedId));
+    const color1 = Number.isNaN(parsedColor1) ? 12 : Math.min(999, Math.max(0, parsedColor1));
+    const color2 = Number.isNaN(parsedColor2) ? 3 : Math.min(999, Math.max(0, parsedColor2));
+    const glow = Number.isNaN(parsedGlow) ? -1 : Math.min(999, Math.max(-1, parsedGlow));
+
+    return { type, id, color1, color2, glow };
+};
+
+
+function getLevelUpdateFromId(levelId) {
+    const id = parseInt(levelId, 10);
+    if (Number.isNaN(id)) return null;
+
+    const ranges = [
+        { version: '1.0', min: 128, max: 1941 },
+        { version: '1.1', min: 1942, max: 10043 },
+        { version: '1.2', min: 10049, max: 63415 },
+        { version: '1.3', min: 63419, max: 121068 },
+        { version: '1.4', min: 121074, max: 184425 },
+        { version: '1.5', min: 184440, max: 420780 },
+        { version: '1.6', min: 420781, max: 827308 },
+        { version: '1.7', min: 827316, max: 1627362 },
+        { version: '1.8', min: 1627371, max: 2810918 },
+        { version: '1.9', min: 2810991, max: 11020426 },
+        { version: '2.0', min: 11020438, max: 28356225 },
+        { version: '2.1', min: 28356243, max: 97454397 },
+        { version: '2.2', min: 97454398, max: Infinity },
+    ];
+
+    const match = ranges.find(range => id >= range.min && id <= range.max);
+    return match ? match.version : null;
+}
+
+async function getEstimatedLevelUploadDate(levelId) {
+    const id = parseInt(levelId, 10);
+    if (Number.isNaN(id)) return null;
+
+    try {
+        const response = await axios.get(`https://history.geometrydash.eu/api/v1/date/level/${id}`, {
+            timeout: 4500,
+            validateStatus: status => status >= 200 && status < 500
+        });
+
+        if (response.status !== 200 || !response.data) return null;
+        return response.data;
+    } catch (err) {
+        console.error(`GDHistory lookup failed for level ${id}:`, err.message);
+        return null;
+    }
+}
+
+
+function parseTimeMachineDate(value) {
+    const raw = String(value || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null;
+
+    const selected = new Date(`${raw}T23:59:59.999Z`);
+    const now = new Date();
+
+    if (Number.isNaN(selected.getTime()) || selected > now) return null;
+    return selected;
+}
+
+function getDateInputValue(date) {
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) return null;
+    return date.toISOString().slice(0, 10);
+}
+
+async function getTimeMachineMinDateValue(list) {
+    const result = await pool.query(`
+        SELECT MIN(created_at) AS first_created_at
+        FROM changelog
+        WHERE list_type = $1
+          AND change_type IN ('added', 'moved', 'deleted')
+    `, [list]);
+
+    const firstCreatedAt = result.rows[0]?.first_created_at;
+    if (!firstCreatedAt) return null;
+
+    const minDate = new Date(firstCreatedAt);
+    if (Number.isNaN(minDate.getTime())) return null;
+
+    minDate.setUTCDate(minDate.getUTCDate());
+    return getDateInputValue(minDate);
+}
+
+function isTimeMachineDateAllowed(selectedDate, minDateValue) {
+    if (!selectedDate || !minDateValue) return false;
+
+    const minDate = new Date(`${minDateValue}T00:00:00.000Z`);
+    if (Number.isNaN(minDate.getTime())) return false;
+
+    return selectedDate >= minDate;
+}
+
+function normalizeDemonSnapshotRows(rows = []) {
+    return rows
+        .map(row => ({
+            ...row,
+            id: row.id == null ? null : Number(row.id),
+            position: Number(row.position),
+            time_machine_deleted_placeholder: Boolean(row.time_machine_deleted_placeholder),
+        }))
+        .filter(row => Number.isFinite(row.position))
+        .sort((a, b) => a.position - b.position);
+}
+
+function normalizeHistoricalPositions(rows = []) {
+    return rows
+        .sort((a, b) => Number(a.position) - Number(b.position))
+        .map((row, index) => ({
+            ...row,
+            position: index + 1,
+        }));
+}
+
+function removeHistoricalEntry(rows, demonId) {
+    const id = Number(demonId);
+    const index = rows.findIndex(row => 
+        Number(row.id) === id || 
+        Number(row.time_machine_original_demon_id) === id
+    );
+    if (index === -1) return null;
+    const [removed] = rows.splice(index, 1);
+    return removed;
+}
+
+function undoHistoricalAdd(rows, log) {
+    const newPosition = Number(log.new_position);
+    if (!Number.isFinite(newPosition)) return rows;
+
+    const removed = removeHistoricalEntry(rows, log.demon_id);
+
+    rows.forEach(row => {
+        if (Number(row.position) > newPosition) {
+            row.position = Number(row.position) - 1;
+        }
+    });
+
+    if (!removed) {
+        rows = normalizeHistoricalPositions(rows);
+    }
+
+    return rows;
+}
+
+function undoHistoricalDelete(rows, log) {
+    const oldPosition = Number(log.old_position);
+    if (!Number.isFinite(oldPosition)) return rows;
+
+    rows.forEach(row => {
+        if (Number(row.position) >= oldPosition) {
+            row.position = Number(row.position) + 1;
+        }
+    });
+
+    rows.push({
+        id: null,
+        name: log.demon_name || 'Deleted Level',
+        author: 'Unknown',
+        position: oldPosition,
+        requirement: 0,
+        level_id: null,
+        showcase_url: null,
+        showcase_link: null,
+        records: [],
+        list_type: log.list_type,
+        time_machine_deleted_placeholder: true,
+        time_machine_original_demon_id: log.demon_id,
+    });
+
+    return rows;
+}
+
+function undoHistoricalMove(rows, log) {
+    const oldPosition = Number(log.old_position);
+    const newPosition = Number(log.new_position);
+
+    if (!Number.isFinite(oldPosition) || !Number.isFinite(newPosition)) return rows;
+
+    const moved = removeHistoricalEntry(rows, log.demon_id) || {
+        id: log.demon_id == null ? null : Number(log.demon_id),
+        name: log.demon_name || 'Archived Level',
+        author: 'Unknown',
+        position: oldPosition,
+        requirement: 0,
+        level_id: null,
+        showcase_url: null,
+        showcase_link: null,
+        records: [],
+        list_type: log.list_type,
+        time_machine_deleted_placeholder: true,
+        time_machine_original_demon_id: log.demon_id,
+    };
+
+    if (newPosition < oldPosition) {
+        rows.forEach(row => {
+            if (Number(row.position) > newPosition && Number(row.position) <= oldPosition) {
+                row.position = Number(row.position) - 1;
+            }
+        });
+    } else if (newPosition > oldPosition) {
+        rows.forEach(row => {
+            if (Number(row.position) >= oldPosition && Number(row.position) < newPosition) {
+                row.position = Number(row.position) + 1;
+            }
+        });
+    }
+
+    moved.position = oldPosition;
+    rows.push(moved);
+
+    return rows;
+}
+
+
+async function queryCurrentDemonSnapshotRows(list) {
+    const result = await pool.query(`
+        SELECT 
+            d.id, d.name, d.author, d.position, d.level_id, d.requirement, d.list_type,
+            d.showcase_url, d.banner_url, d.banner_image_updated_at, COALESCE(d.banner_preview_time, 0) AS banner_preview_time,
+            (d.banner_image IS NOT NULL AND octet_length(d.banner_image) > 0) AS has_banner_image,
+            CASE 
+                WHEN $1 = 'impossible' THEN d.showcase_url
+                ELSE (
+                    SELECT r.video_url 
+                    FROM records r
+                    JOIN users ru ON ru.id = r.user_id
+                    WHERE r.demon_id = d.id 
+                      AND r.status = 'accepted' 
+                      AND r.percentage = 100
+                      AND COALESCE(ru.leaderboard_banned, FALSE) = FALSE
+                    ORDER BY r.id ASC 
+                    LIMIT 1
+                )
+            END AS showcase_link,
+            CASE
+                WHEN $1 = 'impossible' THEN d.showcase_url
+                ELSE (
+                    SELECT r.video_url
+                    FROM records r
+                    JOIN users ru ON ru.id = r.user_id
+                    WHERE r.demon_id = d.id
+                      AND r.status = 'accepted'
+                      AND r.percentage = 100
+                      AND r.verification_id IS NOT NULL
+                      AND COALESCE(ru.leaderboard_banned, FALSE) = FALSE
+                    ORDER BY r.id ASC
+                    LIMIT 1
+                )
+            END AS verification_video_url,
+            COALESCE(
+                (
+                    SELECT json_agg(json_build_object('percentage', r.percentage))
+                    FROM records r
+                    JOIN users ru ON ru.id = r.user_id
+                    WHERE r.demon_id = d.id
+                      AND r.status = 'accepted'
+                      AND COALESCE(ru.leaderboard_banned, FALSE) = FALSE
+                ),
+                '[]'::json
+            ) AS records
+        FROM demons d 
+        WHERE d.list_type = $1
+        ORDER BY d.position ASC
+    `, [list]);
+
+    return result.rows;
+}
+
+async function buildHistoricalDemonSnapshot(currentRows, list, targetDate) {
+    let rows = normalizeDemonSnapshotRows(currentRows);
+
+    const changelogResult = await pool.query(`
+        SELECT demon_id, demon_name, change_type, old_position, new_position, created_at, list_type
+        FROM changelog
+        WHERE list_type = $1
+          AND created_at > $2
+          AND change_type IN ('added', 'moved', 'deleted')
+        ORDER BY created_at DESC, id DESC
+    `, [list, targetDate]);
+
+    for (const log of changelogResult.rows) {
+        if (log.change_type === 'added') {
+            rows = undoHistoricalAdd(rows, log);
+        } else if (log.change_type === 'deleted') {
+            rows = undoHistoricalDelete(rows, log);
+        } else if (log.change_type === 'moved') {
+            rows = undoHistoricalMove(rows, log);
+        }
+
+        rows = normalizeHistoricalPositions(rows);
+    }
+
+    return normalizeHistoricalPositions(rows).map(row => ({
+        ...row,
+        time_machine_snapshot: true,
+    }));
+}
+
+
+const serializeProfileUser = (user) => ({
+    displayName: user.display_name || '',
+    bio: user.bio || '',
+    pronouns: user.pronouns || '',
+    country: user.country || '',
+    discordUsername: user.discord_username || '',
+    socialLinks: {
+        youtube: user.social_youtube || '',
+        twitter: user.social_twitter || '',
+        twitch: user.social_twitch || '',
+        discord: user.discord_username || '',
+        reddit: user.social_reddit || '',
+        gdbrowser: user.social_gdbrowser || '',
+    },
+    icon: {
+        type: user.icon_type || 'cube',
+        id: readProfileInt(user.icon_id, 1),
+        color1: readProfileInt(user.color1, 12),
+        color2: readProfileInt(user.color2, 3),
+        glow: readProfileInt(user.glow, -1),
+    },
+});
+
+
+const STAFF_ROLES = new Set(['moderator', 'admin', 'owner']);
+const ADMIN_ROLES = new Set(['admin', 'owner']);
+const BADGE_CONFIG_PATH = path.join(__dirname, 'badges.json');
+
+function isStaffRole(role) {
+    return STAFF_ROLES.has(String(role || '').toLowerCase());
+}
+
+function canModerateTargetRole(actorRole, targetRole) {
+    const actor = String(actorRole || '').toLowerCase();
+    if (!isStaffRole(targetRole)) return true;
+    return actor === 'owner';
+}
+
+function canReviewSubmission(actorId, targetUserId, actorRole) {
+    if (!isStaffRole(actorRole)) return false;
+    return Number(actorId) !== Number(targetUserId) || String(actorRole || '').toLowerCase() === 'owner';
+}
+
+const ALLOWED_EMAIL_DOMAINS = new Set(['gmail.com', 'outlook.com', 'hotmail.com', 'icloud.com']);
+
+function normalizeEmail(value) {
+    return String(value || '').trim().toLowerCase();
+}
+
+function getEmailIdentity(value) {
+    const email = normalizeEmail(value);
+    const match = email.match(/^([^\s@]+)@([^\s@]+)$/);
+    if (!match) return null;
+
+    const localPart = match[1];
+    const domain = match[2];
+    if (!ALLOWED_EMAIL_DOMAINS.has(domain)) return null;
+
+    if (localPart.includes('+')) return null;
+    if ((localPart.match(/\./g) || []).length > 1) return null;
+
+    const baseLocalPart = localPart.replace(/\./g, '');
+    if (!baseLocalPart) return null;
+
+    return `${baseLocalPart}@${domain}`;
+}
+
+function emailIdentitySql(columnName) {
+    return `LOWER(REPLACE(SPLIT_PART(SPLIT_PART(${columnName}, '@', 1), '+', 1), '.', '')) || '@' || LOWER(SPLIT_PART(${columnName}, '@', 2))`;
+}
+
+function extractYoutubeVideoId(parsedUrl) {
+    const hostname = parsedUrl.hostname.toLowerCase().replace(/^www\./, '').replace(/^m\./, '').replace(/^music\./, '');
+    const parts = parsedUrl.pathname.split('/').filter(Boolean);
+
+    if (hostname === 'youtu.be') {
+        return parts[0] || null;
+    }
+
+    if (hostname === 'youtube.com' || hostname === 'youtube-nocookie.com') {
+        if (parsedUrl.pathname === '/watch') return parsedUrl.searchParams.get('v');
+        if (['shorts', 'embed', 'live'].includes(parts[0])) return parts[1] || null;
+    }
+
+    return null;
+}
+
+function normalizePercentEncoding(pathname) {
+    return String(pathname || '/').replace(/%([0-9a-f]{2})/gi, (match, hex) => {
+        const char = String.fromCharCode(parseInt(hex, 16));
+        return /^[A-Za-z0-9._~-]$/.test(char) ? char : `%${hex.toUpperCase()}`;
+    });
+}
+
+function normalizeVideoSubmission(value) {
+    const raw = String(value || '').trim();
+    try {
+        const parsed = new URL(raw);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+        if (parsed.username || parsed.password) return null;
+
+        const youtubeId = extractYoutubeVideoId(parsed);
+        if (youtubeId && /^[A-Za-z0-9_-]{6,}$/.test(youtubeId)) {
+            const cleanUrl = `https://www.youtube.com/watch?v=${youtubeId}`;
+            return { cleanUrl, key: `youtube:${youtubeId}` };
+        }
+
+        const hostname = parsed.hostname.toLowerCase().replace(/^www\./, '');
+        const parts = parsed.pathname.split('/').filter(Boolean);
+
+        if (hostname === 'twitch.tv') {
+            if (parts[0] === 'videos' && /^\d+$/.test(parts[1] || '') && parts.length === 2) {
+                const id = parts[1];
+                return {
+                    cleanUrl: `https://www.twitch.tv/videos/${id}`,
+                    key: `twitch:video:${id}`,
+                };
+            }
+            if (parts.length === 3 && parts[1] === 'clip' && /^[A-Za-z0-9_-]+$/.test(parts[2])) {
+                const channel = parts[0].toLowerCase();
+                const slug = parts[2];
+                return {
+                    cleanUrl: `https://www.twitch.tv/${channel}/clip/${slug}`,
+                    key: `twitch:clip:${slug}`,
+                };
+            }
+            return null;
+        }
+        if (hostname === 'clips.twitch.tv' && parts.length === 1 && /^[A-Za-z0-9_-]+$/.test(parts[0])) {
+            const slug = parts[0];
+            return {
+                cleanUrl: `https://clips.twitch.tv/${slug}`,
+                key: `twitch:clip:${slug}`,
+            };
+        }
+
+        if (hostname === 'medal.tv') {
+            const clipIndex = parts.findIndex(part => part === 'clip' || part === 'clips');
+            if (clipIndex >= 0 && parts[clipIndex + 1]) {
+                const pathname = '/' + parts.map(encodeURIComponent).join('/');
+                const clipId = parts[clipIndex + 1];
+                return {
+                    cleanUrl: `https://medal.tv${pathname}`,
+                    key: `medal:${clipId}`,
+                };
+            }
+            return null;
+        }
+
+        if (hostname === 'files.catbox.moe') {
+            const pathname = normalizePercentEncoding(parsed.pathname || '/').replace(/\/{2,}/g, '/');
+            if (!/\.(?:mp4|mov|webm)$/i.test(pathname)) return null;
+            if (pathname === '/' || pathname.endsWith('/')) return null;
+            return {
+                cleanUrl: `https://files.catbox.moe${pathname}`,
+                key: `catbox:${pathname.toLowerCase()}`,
+            };
+        }
+
+        return null;
+    } catch (_) {
+        return null;
+    }
+}
+
+async function canReuseOwnSubmissionVideo(db, userId) {
+    const result = await db.query(`
+        SELECT created_at <= NOW() - INTERVAL '7 days' AS can_reuse
+        FROM users
+        WHERE id = $1
+    `, [userId]);
+    return Boolean(result.rows[0]?.can_reuse);
+}
+
+async function findActiveVideoReuse(db, videoKey, {
+    excludeRecordId = null,
+    excludeVerificationId = null,
+    allowOwnUserId = null,
+} = {}) {
+    const allowedOwnUserId = allowOwnUserId == null ? null : Number(allowOwnUserId);
+
+    const recordResult = await db.query(`
+        SELECT id, user_id, video_url
+        FROM records
+        WHERE status IN ('pending', 'accepted', 'rejected')
+          AND video_url IS NOT NULL
+          AND TRIM(video_url) <> ''
+          ${excludeRecordId ? 'AND id <> $1' : ''}
+    `, excludeRecordId ? [excludeRecordId] : []);
+
+    for (const row of recordResult.rows) {
+        const normalized = normalizeVideoSubmission(row.video_url);
+        if (!normalized || normalized.key !== videoKey) continue;
+        if (allowedOwnUserId !== null && Number(row.user_id) === allowedOwnUserId) continue;
+        return { type: 'record', id: row.id, userId: row.user_id };
+    }
+
+    const verificationResult = await db.query(`
+        SELECT id, user_id, video_url
+        FROM verifications
+        WHERE status IN ('pending', 'accepted', 'rejected')
+          AND video_url IS NOT NULL
+          AND TRIM(video_url) <> ''
+          ${excludeVerificationId ? 'AND id <> $1' : ''}
+    `, excludeVerificationId ? [excludeVerificationId] : []);
+
+    for (const row of verificationResult.rows) {
+        const normalized = normalizeVideoSubmission(row.video_url);
+        if (!normalized || normalized.key !== videoKey) continue;
+        if (allowedOwnUserId !== null && Number(row.user_id) === allowedOwnUserId) continue;
+        return { type: 'verification', id: row.id, userId: row.user_id };
+    }
+
+    return null;
+}
+
+async function getSubmissionRestriction(db, userId) {
+    const result = await db.query(`
+        SELECT COALESCE(leaderboard_banned, FALSE) AS leaderboard_banned,
+               COALESCE(account_disabled, FALSE) AS account_disabled
+        FROM users
+        WHERE id = $1
+    `, [userId]);
+    const user = result.rows[0];
+    if (!user) return 'User not found.';
+    if (user.account_disabled) return 'This account is disabled.';
+    if (user.leaderboard_banned) return 'Leaderboard-banned users cannot submit records.';
+    return null;
+}
+
+async function getNewAccountSubmissionRateLimit(db, userId) {
+    await db.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`submission-rate-limit:${userId}`]);
+
+    const result = await db.query(`
+        SELECT
+            u.created_at,
+            CASE
+                WHEN u.created_at > NOW() - INTERVAL '24 hours' THEN 2
+                WHEN u.created_at > NOW() - INTERVAL '7 days' THEN 5
+                ELSE NULL
+            END AS hourly_limit,
+            (
+                (SELECT COUNT(*)::INTEGER
+                 FROM records r
+                 WHERE r.user_id = u.id
+                   AND r.created_at >= NOW() - INTERVAL '1 hour')
+                +
+                (SELECT COUNT(*)::INTEGER
+                 FROM verifications v
+                 WHERE v.user_id = u.id
+                   AND v.created_at >= NOW() - INTERVAL '1 hour')
+            ) AS recent_submissions
+        FROM users u
+        WHERE u.id = $1
+    `, [userId]);
+
+    const row = result.rows[0];
+    if (!row || row.hourly_limit === null) return null;
+
+    const limit = Number(row.hourly_limit);
+    const recent = Number(row.recent_submissions || 0);
+    return recent >= limit
+        ? 'You have sent too many submissions, please try again later.'
+        : null;
+}
+
+function normalizeEnjoymentRating(value, percentage) {
+    if (value === '' || value === null || value === undefined) return null;
+    const parsed = parseInt(value, 10);
+    if (parseInt(percentage, 10) !== 100 || Number.isNaN(parsed) || parsed < 1 || parsed > 10) {
+        return null;
+    }
+    return parsed;
+}
+
+function normalizePersonalPlacement(value, percentage) {
+    if (value === '' || value === null || value === undefined) return null;
+    const parsed = Number(value);
+    if (Number(percentage) !== 100 || !Number.isInteger(parsed) || parsed < 1 || parsed > 150) {
+        return null;
+    }
+    return parsed;
+}
+
+function hasMoreThanTwoDecimalPlaces(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return false;
+    return Math.abs((numeric * 100) - Math.round(numeric * 100)) > 1e-9;
+}
+
+function isValidHttpUrl(value) {
+    try {
+        const parsed = new URL(String(value || '').trim());
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch (_) {
+        return false;
+    }
+}
+
+function loadBadgeConfig() {
+    try {
+        const parsed = JSON.parse(fs.readFileSync(BADGE_CONFIG_PATH, 'utf8'));
+        return Array.isArray(parsed.groups) ? parsed : { groups: [] };
+    } catch (err) {
+        console.error('Badge config load error:', err);
+        return { groups: [] };
+    }
+}
+
+function formatTrackedDuration(totalSeconds) {
+    const seconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    const parts = [];
+    if (days) parts.push(`${days} day${days === 1 ? '' : 's'}`);
+    if (hours || days) parts.push(`${hours} hour${hours === 1 ? '' : 's'}`);
+    if (minutes || hours || days) parts.push(`${minutes} minute${minutes === 1 ? '' : 's'}`);
+    if (!parts.length) parts.push(`${secs} second${secs === 1 ? '' : 's'}`);
+    return parts.slice(0, 3).join(', ');
+}
+
+async function createInboxNotification(db, {
+    userId,
+    actorId = null,
+    recordId = null,
+    type = 'message',
+    reason = null,
+    listType = 'primary',
+    subject,
+    body,
+    senderName = null,
+}) {
+    if (!userId || !subject || !body) return null;
+    return db.query(`
+        WITH recipient AS (
+            SELECT id
+            FROM users
+            WHERE id = $1
+              AND COALESCE(account_disabled, FALSE) = FALSE
+            FOR SHARE
+        )
+        INSERT INTO notifications
+            (user_id, actor_id, record_id, type, reason, list_type, subject, body, sender_name, is_read)
+        SELECT recipient.id, $2, $3, $4, $5, $6, $7, $8, $9, FALSE
+        FROM recipient
+        RETURNING id
+    `, [userId, actorId, recordId, type, reason, listType, subject, body, senderName]);
+}
+
+
+async function logModerationAction(db, {
+    moderatorId,
+    submissionType,
+    decision,
+    listType = 'primary',
+    submissionId = null,
+    submitterId = null,
+}) {
+    if (!moderatorId) return null;
+    if (!['record', 'verification'].includes(submissionType)) return null;
+    if (!['accepted', 'rejected'].includes(decision)) return null;
+
+    return db.query(`
+        UPDATE users
+        SET moderation_actions = COALESCE(moderation_actions, '[]'::jsonb) ||
+            jsonb_build_array(
+                jsonb_build_object(
+                    'type', $2::text,
+                    'decision', $3::text,
+                    'listType', $4::text,
+                    'submissionId', $5::integer,
+                    'submitterId', $6::integer,
+                    'at', CURRENT_TIMESTAMP
+                )
+            )
+        WHERE id = $1
+    `, [moderatorId, submissionType, decision, listType, submissionId, submitterId]);
+}
+
+
+async function notifySubmissionSubscribers({
+    recordId,
+    submitterId,
+    demonId,
+    percentage,
+    videoUrl,
+    enjoymentRating = null,
+    listType = 'primary',
+    isUpdate = false,
+}) {
+    try {
+        const detailsResult = await pool.query(`
+            SELECT
+                u.username,
+                COALESCE(NULLIF(u.display_name, ''), u.username) AS submitter_name,
+                d.name AS demon_name,
+                d.position
+            FROM users u
+            CROSS JOIN demons d
+            WHERE u.id = $1 AND d.id = $2
+        `, [submitterId, demonId]);
+        const details = detailsResult.rows[0];
+        if (!details) return;
+
+        const actionLabel = isUpdate ? 'updated a record submission' : 'submitted a new record';
+        const subject = `${isUpdate ? 'Updated' : 'New'} record submission: ${details.demon_name}`;
+        const enjoymentLine = enjoymentRating == null ? '' : `
+
+**Enjoyment:** ${enjoymentRating}/10`;
+        const body = `**${details.submitter_name}** ${actionLabel} for **${details.demon_name}** at **${percentage}%**.${enjoymentLine}`;
+
+        await pool.query(`
+            INSERT INTO notifications
+                (user_id, actor_id, record_id, type, reason, list_type, subject, body, sender_name, is_read)
+            SELECT
+                recipient.id,
+                $1,
+                $2,
+                'record_submission',
+                NULL,
+                $3,
+                $4,
+                $5,
+                $6,
+                FALSE
+            FROM users recipient
+            WHERE LOWER(COALESCE(recipient.role, '')) IN ('moderator', 'admin', 'owner')
+              AND COALESCE(recipient.submission_notifications, FALSE) = TRUE
+              AND COALESCE(recipient.account_disabled, FALSE) = FALSE
+              AND recipient.id <> $7::integer
+        `, [submitterId, recordId, listType, subject, body, details.submitter_name, submitterId]);
+
+        const discordRecipients = await pool.query(`
+            SELECT discord_id
+            FROM users
+            WHERE LOWER(COALESCE(role, '')) IN ('moderator', 'admin', 'owner')
+              AND COALESCE(submission_discord_ping, FALSE) = TRUE
+              AND COALESCE(account_disabled, FALSE) = FALSE
+              AND discord_id IS NOT NULL
+              AND id <> $1::integer
+        `, [submitterId]);
+
+        const sendDiscordNotification = app.locals.sendDiscordSubmissionNotification;
+        if (typeof sendDiscordNotification === 'function' && discordRecipients.rows.length) {
+            sendDiscordNotification({
+                discordIds: discordRecipients.rows.map(row => String(row.discord_id)),
+                submitterName: details.submitter_name,
+                demonName: details.demon_name,
+                position: Number(details.position),
+                percentage: Number(percentage),
+                videoUrl,
+                enjoymentRating,
+                listType,
+                isUpdate,
+            }).catch(err => {
+                console.error('Discord submission notification error:', err);
+            });
+        }
+    } catch (err) {
+        console.error('Submission subscriber notification error:', err);
+    }
+}
+
+async function notifyVerificationSubscribers({
+    verificationId,
+    submitterId,
+    levelName,
+    levelAuthor,
+    levelId,
+    placementOpinion,
+    videoUrl,
+    listType = 'primary',
+}) {
+    const position = Number.parseInt(placementOpinion, 10);
+    if (!Number.isInteger(position) || position < 1 || position > 150) return;
+
+    try {
+        const submitterResult = await pool.query(`
+            SELECT COALESCE(NULLIF(display_name, ''), username) AS submitter_name
+            FROM users
+            WHERE id = $1
+        `, [submitterId]);
+        const submitterName = submitterResult.rows[0]?.submitter_name || 'A user';
+        const subject = `New verification submission: ${levelName}`;
+        const body = `**${submitterName}** submitted a verification for **${levelName}** by **${levelAuthor}**.\n\n**Placement opinion:** #${position}\n**Level ID:** ${levelId}\n**Video:** [Open verification](${videoUrl})`;
+
+        await pool.query(`
+            INSERT INTO notifications
+                (user_id, actor_id, type, reason, list_type, subject, body, sender_name, is_read)
+            SELECT
+                recipient.id,
+                $1,
+                'verification_submission',
+                NULL,
+                $2,
+                $3,
+                $4,
+                $5,
+                FALSE
+            FROM users recipient
+            WHERE LOWER(COALESCE(recipient.role, '')) IN ('admin', 'owner')
+              AND COALESCE(recipient.verification_notifications, FALSE) = TRUE
+              AND COALESCE(recipient.account_disabled, FALSE) = FALSE
+              AND COALESCE(recipient.verification_notification_max_position, 150) >= $6::integer
+              AND recipient.id <> $1::integer
+        `, [submitterId, listType, subject, body, submitterName, position]);
+
+        const discordRecipients = await pool.query(`
+            SELECT discord_id
+            FROM users
+            WHERE LOWER(COALESCE(role, '')) IN ('admin', 'owner')
+              AND COALESCE(verification_discord_ping, FALSE) = TRUE
+              AND COALESCE(account_disabled, FALSE) = FALSE
+              AND COALESCE(verification_notification_max_position, 150) >= $2::integer
+              AND discord_id IS NOT NULL
+              AND id <> $1::integer
+        `, [submitterId, position]);
+
+        const sendDiscordNotification = app.locals.sendDiscordVerificationNotification;
+        if (typeof sendDiscordNotification === 'function' && discordRecipients.rows.length) {
+            sendDiscordNotification({
+                discordIds: discordRecipients.rows.map(row => String(row.discord_id)),
+                submitterName,
+                levelName,
+                levelAuthor,
+                levelId,
+                position,
+                videoUrl,
+                listType,
+                verificationId,
+            }).catch(err => {
+                console.error('Discord verification notification error:', err);
+            });
+        }
+    } catch (err) {
+        console.error('Verification subscriber notification error:', err);
+    }
+}
+
+async function getCurrentLeaderboardLeader(db, list) {
+    const result = await db.query(`
+        WITH PlayerStats AS (
+            SELECT
+                u.id,
+                SUM(
+                    CASE
+                        WHEN d.position > 150 THEN 0
+                        WHEN $1 = 'impossible' THEN
+                            (250 * EXP(-0.0263 * (d.position - 1))) * (r.percentage / 100.0)
+                        ELSE
+                            CASE
+                                WHEN r.percentage = 100 THEN (250 * EXP(-0.0263 * (d.position - 1)))
+                                WHEN d.position <= 75 AND r.percentage >= d.requirement THEN
+                                    (250 * EXP(-0.0263 * (d.position - 1))) / 10
+                                ELSE 0
+                            END
+                    END
+                ) AS total_points
+            FROM users u
+            JOIN records r ON u.id = r.user_id
+            JOIN demons d ON r.demon_id = d.id
+            WHERE r.status = 'accepted'
+              AND r.list_type = $1
+              AND d.list_type = $1
+              AND COALESCE(u.leaderboard_banned, FALSE) = FALSE
+            GROUP BY u.id
+        )
+        SELECT id
+        FROM PlayerStats
+        WHERE total_points > 0
+        ORDER BY total_points DESC, id ASC
+        LIMIT 1
+    `, [list]);
+    return result.rows[0]?.id || null;
+}
+
+async function syncLeaderboardTopOne(list, db = pool) {
+    return { changedUserIds: [] };
+}
+
+async function recordTopOne(db = pool) {
+    const client = db === pool ? await pool.connect() : db;
+    const ownsClient = client !== db;
+    try {
+        if (ownsClient) await client.query('BEGIN');
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext('wbdl_top1_daily_days'))`);
+        const currentLeaderId = await getCurrentLeaderboardLeader(client, 'primary');
+        if (!currentLeaderId) {
+            if (ownsClient) await client.query('COMMIT');
+            return null;
+        }
+        const result = await client.query(`
+            UPDATE users
+            SET top_1_days = COALESCE(top_1_days, 0) + 1
+            WHERE id = $1
+            RETURNING id, top_1_days
+        `, [currentLeaderId]);
+        if (ownsClient) await client.query('COMMIT');
+        return result.rows[0] || null;
+    } catch (err) {
+        if (ownsClient) await client.query('ROLLBACK').catch(() => {});
+        throw err;
+    } finally {
+        if (ownsClient) client.release();
+    }
+}
+
+async function getBadgeMetrics(userId, list, db = pool) {
+    const result = await db.query(`
+        SELECT
+            (
+                SELECT created_at
+                FROM users
+                WHERE id = $1
+            ) AS joined_at,
+            (
+                SELECT COALESCE(leaderboard_banned, FALSE)
+                FROM users
+                WHERE id = $1
+            ) AS leaderboard_banned,
+            (
+                SELECT COUNT(DISTINCT r.demon_id)::int
+                FROM records r
+                JOIN demons d ON d.id = r.demon_id
+                WHERE r.user_id = $1
+                  AND r.status = 'accepted'
+                  AND COALESCE(r.percentage, 0) = 100
+                  AND r.list_type = $2
+                  AND d.list_type = $2
+                  AND d.position <= 150
+            ) AS completed_levels,
+            (
+                SELECT COUNT(*)::int
+                FROM verifications v
+                JOIN users vu ON vu.id = v.user_id
+                WHERE v.user_id = $1
+                  AND v.status = 'accepted'
+                  AND v.list_type = $2
+                  AND COALESCE(vu.leaderboard_banned, FALSE) = FALSE
+            ) AS verified_levels,
+            (
+                SELECT COUNT(DISTINCT r.demon_id)::int
+                FROM records r
+                JOIN demons d ON d.id = r.demon_id
+                WHERE r.user_id = $1
+                  AND r.status = 'accepted'
+                  AND COALESCE(r.percentage, 0) = 100
+                  AND r.list_type = $2
+                  AND d.list_type = $2
+                  AND (r.accepted_position <= 25 OR (r.accepted_position IS NULL AND d.position <= 25))
+            ) AS completed_top_25,
+            (
+                SELECT COUNT(DISTINCT r.demon_id)::int
+                FROM records r
+                JOIN demons d ON d.id = r.demon_id
+                WHERE r.user_id = $1
+                  AND r.status = 'accepted'
+                  AND COALESCE(r.percentage, 0) = 100
+                  AND r.list_type = $2
+                  AND d.list_type = $2
+                  AND (r.accepted_position <= 10 OR (r.accepted_position IS NULL AND d.position <= 10))
+            ) AS completed_top_10,
+            (
+                SELECT COUNT(DISTINCT r.demon_id)::int
+                FROM records r
+                JOIN demons d ON d.id = r.demon_id
+                WHERE r.user_id = $1
+                  AND r.status = 'accepted'
+                  AND COALESCE(r.percentage, 0) = 100
+                  AND r.list_type = $2
+                  AND d.list_type = $2
+                  AND (r.accepted_position = 1 OR (r.accepted_position IS NULL AND d.position = 1))
+            ) AS completed_top_1,
+            (
+                SELECT COALESCE(top_1_days, 0)::int * 86400
+                FROM users
+                WHERE id = $1
+            ) AS top_1_duration_seconds
+    `, [userId, list]);
+
+    const row = result.rows[0] || {};
+    return {
+        joined_at: row.joined_at || null,
+        leaderboard_banned: Boolean(row.leaderboard_banned),
+        completed_levels: Number(row.completed_levels) || 0,
+        verified_levels: Number(row.verified_levels) || 0,
+        completed_top_25: Number(row.completed_top_25) || 0,
+        completed_top_10: Number(row.completed_top_10) || 0,
+        completed_top_1: Number(row.completed_top_1) || 0,
+        top_1_duration_seconds: Number(row.top_1_duration_seconds) || 0,
+    };
+}
+
+const WBDL_RELEASE_AT = Date.parse('2026-04-07T00:00:00.000Z');
+const WBDL_OG_WINDOW_END = Date.parse('2026-04-15T00:00:00.000Z');
+
+function getBadgeMetricValue(metrics, requirement = {}) {
+    if (requirement.type === 'joined_within_release_window') {
+        if (!metrics.joined_at) return 0;
+
+        const joinedAt = new Date(metrics.joined_at).getTime();
+        if (Number.isNaN(joinedAt)) return 0;
+
+        return joinedAt >= WBDL_RELEASE_AT && joinedAt < WBDL_OG_WINDOW_END ? 1 : 0;
+    }
+
+    if (requirement.type === 'top_level_completion') {
+        if (Number(metrics.completed_top_1) > 0) return 3;
+        if (Number(metrics.completed_top_10) > 0) return 2;
+        if (Number(metrics.completed_top_25) > 0) return 1;
+        return 0;
+    }
+
+    return Number(metrics[requirement.type]) || 0;
+}
+
+async function evaluateUserBadges(userId, list, db = pool) {
+    if (list === 'impossible') return [];
+
+    const config = loadBadgeConfig();
+    const metrics = await getBadgeMetrics(userId, list, db);
+    const userResult = await db.query(`
+        SELECT COALESCE(badges, '[]'::jsonb) AS badges
+        FROM users
+        WHERE id = $1
+    `, [userId]);
+
+    if (!userResult.rows.length) return [];
+
+    let storedBadges = Array.isArray(userResult.rows[0].badges)
+        ? userResult.rows[0].badges
+        : [];
+
+    const legacyTopTierByGroup = new Map([
+        ['top-25-completion', 1],
+        ['top-10-completion', 2],
+        ['top-one-completion', 3],
+    ]);
+    const legacyTopProgress = new Map();
+    let hasLegacyTopBadges = false;
+
+    for (const badge of storedBadges) {
+        const legacyTier = legacyTopTierByGroup.get(String(badge?.groupId || ''));
+        if (!legacyTier) continue;
+
+        hasLegacyTopBadges = true;
+        const listType = String(badge?.listType || 'primary');
+        const current = legacyTopProgress.get(listType) || {
+            highestTier: 0,
+            unlockedAt: badge?.unlockedAt || badge?.unlocked_at || new Date().toISOString(),
+        };
+
+        current.highestTier = Math.max(current.highestTier, legacyTier);
+        if (!current.unlockedAt) {
+            current.unlockedAt = badge?.unlockedAt || badge?.unlocked_at || new Date().toISOString();
+        }
+        legacyTopProgress.set(listType, current);
+    }
+
+    if (hasLegacyTopBadges) {
+        const normalizedBadges = storedBadges.filter(
+            badge => !legacyTopTierByGroup.has(String(badge?.groupId || ''))
+        );
+
+        for (const [listType, legacy] of legacyTopProgress) {
+            for (let tierId = 1; tierId <= legacy.highestTier; tierId += 1) {
+                const alreadyStored = normalizedBadges.some(entry =>
+                    String(entry?.groupId || '') === 'top-level-completion'
+                    && Number(entry?.tierId) === tierId
+                    && String(entry?.listType || 'primary') === listType
+                );
+                if (alreadyStored) continue;
+
+                normalizedBadges.push({
+                    groupId: 'top-level-completion',
+                    tierId,
+                    listType,
+                    unlockedAt: legacy.unlockedAt,
+                    metadata: { migratedFromLegacyTopBadge: true },
+                });
+            }
+        }
+
+        await db.query(
+            'UPDATE users SET badges = $2::jsonb WHERE id = $1',
+            [userId, JSON.stringify(normalizedBadges)]
+        );
+        storedBadges = normalizedBadges;
+    }
+
+    const existing = new Map();
+
+    for (const badge of storedBadges) {
+        const groupId = String(badge?.groupId || '');
+        const tierId = Number(badge?.tierId);
+        const listType = String(badge?.listType || 'primary');
+        if (!groupId || !Number.isInteger(tierId)) continue;
+        if (listType !== list && listType !== 'global') continue;
+        existing.set(`${groupId}:${tierId}:${listType}`, badge);
+    }
+
+    for (const group of config.groups) {
+        if (['manual', 'owner_only', 'discord_guild_member'].includes(group?.requirement?.type)) continue;
+
+        const badgeListType = group?.scope === 'global' ? 'global' : list;
+        const progress = getBadgeMetricValue(metrics, group.requirement);
+        for (const tier of Array.isArray(group.tiers) ? group.tiers : []) {
+            const tierId = Number(tier.id);
+            if (!Number.isInteger(tierId) || progress < Number(tier.threshold || 0)) continue;
+
+            const key = `${group.id}:${tierId}:${badgeListType}`;
+            if (existing.has(key)) continue;
+
+            const unlockedAt = new Date().toISOString();
+            const badgeEntry = {
+                groupId: group.id,
+                tierId,
+                listType: badgeListType,
+                unlockedAt,
+                metadata: { progressAtUnlock: progress },
+            };
+
+            const inserted = await db.query(`
+                UPDATE users
+                SET badges = COALESCE(badges, '[]'::jsonb) || $2::jsonb
+                WHERE id = $1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM jsonb_array_elements(COALESCE(badges, '[]'::jsonb)) AS stored(entry)
+                      WHERE stored.entry->>'groupId' = $3
+                        AND stored.entry->>'tierId' = $4
+                        AND COALESCE(stored.entry->>'listType', 'primary') = $5
+                  )
+                RETURNING badges
+            `, [
+                userId,
+                JSON.stringify([badgeEntry]),
+                group.id,
+                String(tierId),
+                badgeListType,
+            ]);
+
+            if (inserted.rows[0]) {
+                existing.set(key, badgeEntry);
+                await createInboxNotification(db, {
+                    userId,
+                    listType: list,
+                    type: 'badge_unlocked',
+                    senderName: 'WBDL',
+                    subject: 'New Badge Unlocked!',
+                    body: `You unlocked **${tier.name || `Badge ${tierId}`}**.\n\n${tier.description || ''}`,
+                });
+            } else {
+                const refreshed = await db.query(`
+                    SELECT COALESCE(badges, '[]'::jsonb) AS badges
+                    FROM users
+                    WHERE id = $1
+                `, [userId]);
+                const match = (Array.isArray(refreshed.rows[0]?.badges) ? refreshed.rows[0].badges : [])
+                    .find(entry => String(entry?.groupId) === String(group.id)
+                        && Number(entry?.tierId) === tierId
+                        && String(entry?.listType || 'primary') === badgeListType);
+                if (match) existing.set(key, match);
+            }
+        }
+    }
+
+    return config.groups.map(group => {
+        const badgeListType = group?.scope === 'global' ? 'global' : list;
+        const progressValue = getBadgeMetricValue(metrics, group.requirement);
+        const tiers = (Array.isArray(group.tiers) ? group.tiers : [])
+            .map(tier => {
+                const tierId = Number(tier.id);
+                const stored = existing.get(`${group.id}:${tierId}:${badgeListType}`);
+                const verificationBadgeSuppressed = group.id === 'verified-levels' && metrics.leaderboard_banned;
+                return {
+                    ...tier,
+                    id: tierId,
+                    iconPath: tier.iconPath || group.iconPath || '/assets/icon.png',
+                    unlocked: !verificationBadgeSuppressed && Boolean(stored),
+                    unlockedAt: stored?.unlockedAt || stored?.unlocked_at || null,
+                };
+            })
+            .filter(tier => Number.isInteger(tier.id));
+        const unlockedTiers = tiers.filter(tier => tier.unlocked);
+        const currentTier = unlockedTiers[unlockedTiers.length - 1] || null;
+        const nextTier = tiers.find(tier => !tier.unlocked) || null;
+        const isDuration = group.requirement?.type === 'top_1_duration_seconds';
+
+        return {
+            id: group.id,
+            iconPath: currentTier?.iconPath || group.iconPath || '/assets/icon.png',
+            requirement: group.requirement || {},
+            unlocked: unlockedTiers.length > 0,
+            currentTier,
+            nextTier,
+            tiers,
+            progress: {
+                value: progressValue,
+                display: isDuration ? formatTrackedDuration(progressValue) : String(progressValue),
+                nextThreshold: nextTier ? Number(nextTier.threshold || 0) : null,
+                nextDisplay: nextTier
+                    ? (isDuration ? formatTrackedDuration(nextTier.threshold) : String(nextTier.threshold))
+                    : null,
+            },
+        };
+    }).filter(group => group.unlocked);
+}
+
+app.get('/api/demons', async (req, res) => {
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const timeMachineDate = parseTimeMachineDate(req.query.date || req.query.time_machine_date);
+
+    try {
+        const currentRows = await queryCurrentDemonSnapshotRows(list);
+
+        if (timeMachineDate) {
+            const minDateValue = await getTimeMachineMinDateValue(list);
+
+            if (isTimeMachineDateAllowed(timeMachineDate, minDateValue)) {
+                const historicalRows = await buildHistoricalDemonSnapshot(currentRows, list, timeMachineDate);
+                return res.json(historicalRows);
+            }
+        }
+
+        res.json(currentRows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Database error" });
+    }
+});
+
+
+app.get('/api/time-machine/min-date', async (req, res) => {
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    try {
+        const minDate = await getTimeMachineMinDateValue(list);
+        res.json({ min_date: minDate });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Failed to fetch time machine minimum date' });
+    }
+});
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+app.get('/login', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'login.html'));
+});
+app.get('/register', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'register.html'));
+});
+app.get('/demon/:id', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'demon.html'));
+});
+app.get('/submit', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'submit.html'));
+});
+app.get('/roulette', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'roulette.html'));
+});
+app.get('/profile', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'profile.html'));
+});
+app.get('/leaderboard', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'leaderboard.html'));
+});
+app.get('/clans', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'clans.html'));
+});
+app.get('/clans/:clanName', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'clans.html'));
+});
+app.get('/account-settings', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'settings.html'));
+});
+app.get('/notifications', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'notifications.html'));
+});
+app.get('/verify', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'verify.html'));
+});
+app.get('/changelog', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'changelog.html'));
+});
+app.get('/guidelines', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'guidelines.html'));
+});
+app.get('/staff', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'staff.html'));
+});
+app.get('/about', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'about.html'));
+});
+app.get('/forgot-password', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'forgot-password.html'));
+});
+app.get('/reset-password', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'reset-password.html'));
+});
+
+const bcrypt = require('bcrypt');
+const session = require('cookie-session');
+
+async function ensureConfiguredOwner() {
+    const username = String(process.env.OWNER_USERNAME || 'zeroGD').trim();
+    const password = String(process.env.OWNER_PASSWORD || '');
+    const email = String(process.env.OWNER_EMAIL || `${username}@local.invalid`).trim();
+
+    if (!username || !password) {
+        console.warn('OWNER_USERNAME/OWNER_PASSWORD not configured; skipping owner bootstrap.');
+        return;
+    }
+
+    try {
+        const existing = await pool.query(
+            'SELECT id FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1',
+            [username]
+        );
+        const passwordHash = await bcrypt.hash(password, 10);
+
+        if (existing.rows.length) {
+            await pool.query(
+                `UPDATE users
+                 SET password_hash = $1, role = 'owner', account_disabled = FALSE
+                 WHERE id = $2`,
+                [passwordHash, existing.rows[0].id]
+            );
+            console.log(`Configured owner account: ${username}`);
+            return;
+        }
+
+        await pool.query(
+            `INSERT INTO users (username, password_hash, email, role)
+             VALUES ($1, $2, $3, 'owner')`,
+            [username, passwordHash, email]
+        );
+        console.log(`Created owner account: ${username}`);
+    } catch (err) {
+        console.error('Owner bootstrap failed:', err.message);
+    }
+}
+
+
+const sessionConfig = {
+  name: 'session',
+  keys: [process.env.SESSION_SECRET],
+  maxAge: 2 * 7 * 24 * 60 * 60 * 1000,
+  sameSite: 'lax'
+};
+
+if (process.env.NODE_ENV === 'production') {
+  sessionConfig.domain = '.webdemonlist.org';
+}
+
+app.use(session(sessionConfig));
+
+app.use(async (req, res, next) => {
+    if (!req.session?.userId || req.path === '/api/logout') return next();
+
+    try {
+        const result = await pool.query(
+            'SELECT account_disabled, account_disabled_reason, role FROM users WHERE id = $1',
+            [req.session.userId]
+        );
+        const user = result.rows[0];
+        if (!user) {
+            req.session = null;
+            if (req.path.startsWith('/api/')) {
+                return res.status(401).json({ error: 'Session expired.', loggedIn: false });
+            }
+            return next();
+        }
+
+        if (user.account_disabled && !isStaffRole(user.role)) {
+            const reason = user.account_disabled_reason || 'This account has been disabled by an administrator.';
+            req.session = null;
+            if (req.path.startsWith('/api/')) {
+                return res.status(403).json({ error: reason, accountDisabled: true });
+            }
+            return res.redirect('/login?disabled=1');
+        }
+
+        next();
+    } catch (err) {
+        console.error('Account enforcement middleware error:', err);
+        next(err);
+    }
+});
+
+app.get('/api/leaderboard/top1-check', async (req, res) => {
+    const cronSecret = process.env.CRON_SECRET || process.env.DISCORD_SYNC_SECRET;
+    if (!cronSecret) return res.status(503).json({ error: 'Cron secret not configured.' });
+
+    const auth = req.headers.authorization || '';
+    const provided = auth.startsWith('Bearer ') ? auth.slice(7) : req.query.secret;
+    if (provided !== cronSecret) return res.status(401).json({ error: 'Unauthorized' });
+
+    try {
+        const result = await recordTopOne();
+        if (result?.id) {
+            await evaluateUserBadges(Number(result.id), 'primary');
+        }
+        res.json({
+            ok: true,
+            leaderId: result?.id ? Number(result.id) : null,
+            top1Days: result?.top_1_days != null ? Number(result.top_1_days) : null,
+        });
+    } catch (err) {
+        console.error('Top 1 tracking error:', err);
+        res.status(500).json({ error: 'Top-1 tracking failed.' });
+    }
+});
+
+require('./discord')(app, pool);
+
+async function sendVerificationEmail(targetEmail, username, link) {
+    await resend.emails.send({
+        from: 'Web Browser Demonlist <verify@webdemonlist.org>',
+        to: targetEmail,
+        subject: 'Verify your WBDL Account',
+        html: `
+        <div style="font-family: Comfortaa, Arial, sans-serif; background-color: #181b1e; color: #f2f3f5; padding: 40px; border-radius: 12px; max-width: 600px; margin: auto; border: 1px solid #2a2f36;">
+            <h1 style="font-family: Comfortaa, Arial, sans-serif; color: #00e676; text-align: center; margin: 0 0 22px; font-size: 28px; line-height: 1.2;">
+                Welcome, ${username}!
+            </h1>
+            
+            <p style="font-size: 16px; line-height: 1.6; text-align: center; color: #8b929c; margin: 0;">
+                Thanks for signing up for the Web Browser Demonlist! To get started, activate your account by clicking the button below.
+            </p>
+
+            <div style="text-align: center; margin: 30px 0;">
+                <a href="${link}" style="background-color: #00e676; color: #000; padding: 14px 28px; font-weight: 800; text-decoration: none; border-radius: 8px; display: inline-block; font-size: 15px;">
+                    Verify my Account
+                </a>
+            </div>
+
+            <div style="background-color: #20242a; padding: 20px; border-radius: 8px; text-align: center; margin-top: 20px; border: 1px solid #2a2f36;">
+                <p style="margin: 0 0 10px 0; color: #f2f3f5; font-size: 14px;">
+                    Also, feel free to join the discord!
+                </p>
+                <a href="https://discord.gg/Pz8TehUPmP" style="color: #5865F2; text-decoration: none; font-weight: bold; font-size: 16px;">
+                discord.gg/Pz8TehUPmP
+                </a>
+            </div>
+
+            <hr style="border: 0; border-top: 1px solid #2a2f36; margin: 24px 0;">
+            
+            <p style="font-size: 12px; color: #5a616b; text-align: center; margin: 0;">
+                If you didn't create an account, simply ignore this email.
+            </p>
+        </div>
+        `
+    });
+}
+
+
+async function sendEmailChangeVerification(targetEmail, username, link) {
+    await resend.emails.send({
+        from: 'Web Browser Demonlist <verify@webdemonlist.org>',
+        to: targetEmail,
+        subject: 'Verify your new WBDL email',
+        html: `
+        <div style="font-family: Comfortaa, Arial, sans-serif; background-color: #181b1e; color: #f2f3f5; padding: 40px; border-radius: 12px; max-width: 600px; margin: auto; border: 1px solid #2a2f36;">
+            <h1 style="color: #00e676; text-align: center; margin: 0 0 22px; font-size: 28px; line-height: 1.2;">
+                Verify your new email
+            </h1>
+
+            <p style="font-size: 16px; line-height: 1.6; text-align: center; color: #8b929c; margin: 0;">
+                Hello ${username}, click the button below to confirm this email address for your WBDL account.
+            </p>
+
+            <div style="text-align: center; margin: 30px 0;">
+                <a href="${link}" style="background-color: #00e676; color: #000; padding: 14px 28px; font-weight: 800; text-decoration: none; border-radius: 8px; display: inline-block; font-size: 15px;">
+                    Verify new email
+                </a>
+            </div>
+
+            <p style="font-size: 12px; color: #5a616b; text-align: center; margin: 0;">
+                This link expires in 24 hours. Your current email will remain unchanged until this link is opened.
+            </p>
+        </div>
+        `
+    });
+}
+
+async function sendResetEmail(targetEmail, username, link) {
+    await resend.emails.send({
+        from: 'Web Browser Demonlist <support@webdemonlist.org>',
+        to: targetEmail,
+        subject: 'WBDL Password Reset',
+        html: `
+        <div style="font-family: Nunito, Arial, sans-serif; background-color: #181b1e; color: #f2f3f5; padding: 40px; border-radius: 12px; max-width: 600px; margin: auto; border: 1px solid #2a2f36;">
+            <h1 style="font-family: Comfortaa, Arial, sans-serif; color: #00e676; text-align: center; margin: 0 0 22px; font-size: 28px; line-height: 1.2;">
+                Password Reset Request
+            </h1>
+
+            <p style="text-align: center; color: #8b929c; font-size: 16px; line-height: 1.6; margin: 0;">
+                Hello ${username}, we received a request to reset your account's password. Click the button below to proceed.
+            </p>
+
+            <div style="text-align: center; margin: 30px 0;">
+                <a href="${link}" style="background-color: #00e676; color: #000; padding: 14px 28px; font-weight: 800; text-decoration: none; border-radius: 8px; display: inline-block; font-size: 15px;">
+                    Reset Password
+                </a>
+            </div>
+
+            <p style="font-size: 12px; color: #5a616b; text-align: center; margin: 0;">
+                This link will expire in 1 hour. If you didn't request this, you can safely ignore this email.
+            </p>
+        </div>
+        `
+    });
+}
+
+app.post('/api/register', async (req, res) => {
+    const { username, password, email, captchaToken } = req.body;
+    const SECRET_KEY = process.env.RECAPTCHA_SECRET;
+
+    try {
+        const params = new URLSearchParams();
+        params.append('secret', SECRET_KEY);
+        params.append('response', captchaToken);
+
+        const googleRes = await axios.post(
+            'https://www.google.com/recaptcha/api/siteverify',
+            params
+        );
+
+        if (!googleRes.data.success) {
+            return res.status(400).json({ error: "bro is a bot" });
+        }
+    } catch (err) {
+        return res.status(500).json({ error: "Error verifying CAPTCHA." });
+    }
+
+    const normalizedEmail = normalizeEmail(email);
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+        return res.status(400).json({ error: "Please enter a valid email address." });
+    }
+    const emailIdentity = getEmailIdentity(normalizedEmail);
+    if (!emailIdentity) {
+        return res.status(400).json({ error: "Email validation failed. Please try a different email." });
+    }
+
+    const userError = validateUsername(username);
+    if (userError) return res.status(400).json({ error: userError });
+
+    const passError = validatePassword(password);
+    if (passError) return res.status(400).json({ error: passError });
+
+    const token = randomBytes(32).toString('hex');
+    let insertedPendingUser = false;
+    const client = await pool.connect();
+    try {
+        const hashedPassword = await bcrypt.hash(password, 10);
+        await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [emailIdentity]);
+
+        const usernameCheck = await client.query(
+            `SELECT id FROM users WHERE LOWER(username) = LOWER($1)
+             UNION
+             SELECT 1 FROM pending_users WHERE LOWER(username) = LOWER($1)`,
+            [username]
+        );
+
+        if (usernameCheck.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "That username is already taken." });
+        }
+
+        const emailCheck = await client.query(`
+            SELECT id FROM users WHERE ${emailIdentitySql('email')} = $1
+            UNION ALL
+            SELECT 1 FROM pending_users WHERE ${emailIdentitySql('email')} = $1
+            UNION ALL
+            SELECT 1 FROM pending_email_changes
+            WHERE ${emailIdentitySql('email')} = $1 AND expires_at > NOW()
+            LIMIT 1
+        `, [emailIdentity]);
+
+        if (emailCheck.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "That email is already in use." });
+        }
+
+        await client.query(
+            'INSERT INTO pending_users (token, username, password_hash, email) VALUES ($1, $2, $3, $4)',
+            [token, username, hashedPassword, normalizedEmail]
+        );
+        insertedPendingUser = true;
+        await client.query('COMMIT');
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error(err);
+        return res.status(500).json({ error: "An error occurred during registration." });
+    } finally {
+        client.release();
+    }
+
+    try {
+        const verifyLink = `https://webdemonlist.org/verify?token=${token}`;
+        await sendVerificationEmail(normalizedEmail, username, verifyLink);
+        return res.json({ message: "Verification email sent! Please check your inbox (and spam folder)." });
+    } catch (err) {
+        if (insertedPendingUser) {
+            await pool.query('DELETE FROM pending_users WHERE token = $1', [token]).catch(() => {});
+        }
+        console.error(err);
+        return res.status(500).json({ error: "An error occurred while sending the verification email." });
+    }
+});
+
+app.get('/api/verify', async (req, res) => {
+    const token = String(req.query.token || '').trim();
+    if (!token) {
+        return res.status(400).json({ error: "Missing verification token." });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const pendingRegistration = await client.query(
+            'SELECT * FROM pending_users WHERE token = $1 FOR UPDATE',
+            [token]
+        );
+
+        if (pendingRegistration.rows.length) {
+            const user = pendingRegistration.rows[0];
+            const emailIdentity = getEmailIdentity(user.email);
+            if (!emailIdentity) {
+                await client.query('DELETE FROM pending_users WHERE token = $1', [token]);
+                await client.query('COMMIT');
+                return res.status(400).json({ error: "Email validation failed. Please try a different email." });
+            }
+
+            await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [emailIdentity]);
+            const duplicate = await client.query(`
+                SELECT id FROM users
+                WHERE ${emailIdentitySql('email')} = $1
+                LIMIT 1
+            `, [emailIdentity]);
+            if (duplicate.rows.length) {
+                await client.query('DELETE FROM pending_users WHERE token = $1', [token]);
+                await client.query('COMMIT');
+                return res.status(409).json({ error: "That email address is already in use." });
+            }
+
+            await client.query(
+                'INSERT INTO users (username, password_hash, email) VALUES ($1, $2, $3)',
+                [user.username, user.password_hash, normalizeEmail(user.email)]
+            );
+            await client.query('DELETE FROM pending_users WHERE token = $1', [token]);
+            await client.query('COMMIT');
+
+            return res.status(200).json({
+                message: "Your account is now active. You may now log in.",
+                verificationType: 'account',
+            });
+        }
+
+        const pendingEmailResult = await client.query(`
+            SELECT user_id, email, expires_at
+            FROM pending_email_changes
+            WHERE token = $1
+            FOR UPDATE
+        `, [token]);
+        const pendingEmail = pendingEmailResult.rows[0];
+
+        if (!pendingEmail) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "This link is invalid or has already been used." });
+        }
+
+        if (new Date(pendingEmail.expires_at).getTime() <= Date.now()) {
+            await client.query('DELETE FROM pending_email_changes WHERE token = $1', [token]);
+            await client.query('COMMIT');
+            return res.status(400).json({ error: "This email verification link has expired." });
+        }
+
+        const pendingEmailIdentity = getEmailIdentity(pendingEmail.email);
+        if (!pendingEmailIdentity) {
+            await client.query('DELETE FROM pending_email_changes WHERE token = $1', [token]);
+            await client.query('COMMIT');
+            return res.status(400).json({ error: "Email validation failed. Please try a different email." });
+        }
+
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [pendingEmailIdentity]);
+        const duplicate = await client.query(`
+            SELECT id FROM users
+            WHERE ${emailIdentitySql('email')} = $1 AND id != $2
+            LIMIT 1
+        `, [pendingEmailIdentity, pendingEmail.user_id]);
+        if (duplicate.rows.length) {
+            await client.query('DELETE FROM pending_email_changes WHERE token = $1', [token]);
+            await client.query('COMMIT');
+            return res.status(409).json({ error: "That email address is already in use." });
+        }
+
+        const updated = await client.query(
+            'UPDATE users SET email = $1 WHERE id = $2 RETURNING id',
+            [pendingEmail.email, pendingEmail.user_id]
+        );
+        if (!updated.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "The account for this email change no longer exists." });
+        }
+
+        await client.query(
+            'DELETE FROM pending_email_changes WHERE user_id = $1',
+            [pendingEmail.user_id]
+        );
+        await client.query('COMMIT');
+
+        return res.status(200).json({
+            message: "Your email address has been updated successfully.",
+            verificationType: 'email-change',
+            email: pendingEmail.email,
+        });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Verification error:', err);
+        return res.status(500).json({ error: "Internal server error during verification." });
+    } finally {
+        client.release();
+    }
+});
+
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+    try {
+        const userResult = await pool.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [username]);
+        if (!userResult.rows.length) {
+            clearTwoFactorLoginChallenge(req);
+            return res.status(401).json({ error: "Invalid credentials" });
+        }
+
+        const user = userResult.rows[0];
+        const validPassword = await bcrypt.compare(password, user.password_hash);
+        if (!validPassword) {
+            clearTwoFactorLoginChallenge(req);
+            return res.status(401).json({ error: "Invalid credentials" });
+        }
+
+        if (user.account_disabled && !isStaffRole(user.role)) {
+            clearTwoFactorLoginChallenge(req);
+            return res.status(403).json({
+                error: "This account has been disabled. \n Reason: " + (user.account_disabled_reason || "Banned"),
+                accountDisabled: true,
+            });
+        }
+
+        const methods = getStoredTwoFactorMethods(user.two_factor_method);
+        if (methods.length) {
+            if (methods.includes('email') && !user.email) {
+                return res.status(500).json({ error: '2FA is not configured correctly for email.' });
+            }
+            if (methods.includes('app') && !user.two_factor_secret) {
+                return res.status(500).json({ error: '2FA is not configured correctly for your authenticator app.' });
+            }
+
+            let challenge = {
+                userId: Number(user.id),
+                username: user.username,
+                availableMethods: methods,
+                method: null,
+                expiresAt: Date.now() + TWO_FACTOR_CODE_TTL_MS,
+                attempts: 0,
+                lastSentAt: 0,
+            };
+
+            if (methods.length === 1) {
+                const method = methods[0];
+                challenge.method = method;
+                if (method === 'email') {
+                    const code = generateEmailTwoFactorCode();
+                    await sendTwoFactorCodeEmail(user.email, user.username, code, 'login');
+                    challenge.codeHash = hashTwoFactorCode(code, user.id, 'login');
+                    challenge.lastSentAt = Date.now();
+                }
+            }
+
+            req.session.userId = null;
+            req.session.username = null;
+            req.session.twoFactorLogin = challenge;
+            return res.status(202).json({
+                twoFactorRequired: true,
+                chooseMethod: methods.length > 1,
+                methods,
+                method: challenge.method,
+                message: challenge.method === 'email'
+                    ? `A 6-digit code was sent to ${maskEmailAddress(user.email)}.`
+                    : challenge.method === 'app'
+                        ? 'Enter the 6-digit code from your authenticator app.'
+                        : 'Choose how you want to verify your login.',
+            });
+        }
+
+        clearTwoFactorLoginChallenge(req);
+        req.session.userId = user.id;
+        req.session.username = user.username;
+        return res.json({ message: "Logged in!", username: user.username });
+    } catch (err) {
+        console.error('Login error:', err);
+        return res.status(500).json({ error: 'Could not complete login.' });
+    }
+});
+
+app.post('/api/login/2fa/select', async (req, res) => {
+    const challenge = req.session?.twoFactorLogin;
+    if (!challenge?.userId || challenge.expiresAt <= Date.now()) {
+        clearTwoFactorLoginChallenge(req);
+        return res.status(401).json({ error: 'Your authentication session expired. Please sign in again.' });
+    }
+
+    const method = String(req.body?.method || '').toLowerCase();
+    const availableMethods = Array.isArray(challenge.availableMethods) ? challenge.availableMethods : [];
+    if (!['email', 'app'].includes(method) || !availableMethods.includes(method)) {
+        return res.status(400).json({ error: 'That 2FA method is not available for this account.' });
+    }
+
+    try {
+        const result = await pool.query(`
+            SELECT id, username, email, two_factor_method, two_factor_secret
+            FROM users WHERE id = $1
+        `, [challenge.userId]);
+        const user = result.rows[0];
+        if (!user || !hasStoredTwoFactorMethod(user.two_factor_method, method)) {
+            clearTwoFactorLoginChallenge(req);
+            return res.status(401).json({ error: 'Your 2FA settings changed. Please sign in again.' });
+        }
+
+        const nextChallenge = {
+            ...challenge,
+            availableMethods: getStoredTwoFactorMethods(user.two_factor_method),
+            method,
+            expiresAt: Date.now() + TWO_FACTOR_CODE_TTL_MS,
+            attempts: 0,
+            lastSentAt: Number(challenge.lastSentAt || 0),
+            codeHash: null,
+        };
+
+        let message;
+        if (method === 'email') {
+            if (!user.email) return res.status(500).json({ error: 'This account has no email address available for 2FA.' });
+            const elapsed = Date.now() - Number(challenge.lastSentAt || 0);
+            if (challenge.lastSentAt && elapsed < TWO_FACTOR_RESEND_COOLDOWN_MS) {
+                return res.status(429).json({ error: `Please wait ${Math.ceil((TWO_FACTOR_RESEND_COOLDOWN_MS - elapsed) / 1000)} seconds before requesting another code.` });
+            }
+            const code = generateEmailTwoFactorCode();
+            await sendTwoFactorCodeEmail(user.email, user.username, code, 'login');
+            nextChallenge.codeHash = hashTwoFactorCode(code, user.id, 'login');
+            nextChallenge.lastSentAt = Date.now();
+            message = `A 6-digit code was sent to ${maskEmailAddress(user.email)}.`;
+        } else {
+            if (!user.two_factor_secret) return res.status(500).json({ error: '2FA is not configured correctly for your authenticator app.' });
+            message = 'Enter the 6-digit code from your authenticator app.';
+        }
+
+        req.session.twoFactorLogin = nextChallenge;
+        return res.json({ method, message });
+    } catch (err) {
+        console.error('Two-factor method selection error:', err);
+        return res.status(500).json({ error: 'Could not start that 2FA method.' });
+    }
+});
+
+app.post('/api/login/2fa', async (req, res) => {
+    const challenge = req.session?.twoFactorLogin;
+    if (!challenge?.userId || challenge.expiresAt <= Date.now()) {
+        clearTwoFactorLoginChallenge(req);
+        return res.status(401).json({ error: 'Your authentication session expired. Please sign in again.' });
+    }
+    if (!['email', 'app'].includes(String(challenge.method || '').toLowerCase())) {
+        return res.status(400).json({ error: 'Choose an authentication method first.' });
+    }
+
+    const code = normalizeTwoFactorCode(req.body.code);
+    if (!/^\d{6}$/.test(code)) {
+        return res.status(400).json({ error: 'Enter a valid 6-digit code.' });
+    }
+
+    try {
+        const result = await pool.query(`
+            SELECT id, username, role, email, account_disabled, account_disabled_reason,
+                   two_factor_method, two_factor_secret
+            FROM users WHERE id = $1
+        `, [challenge.userId]);
+        const user = result.rows[0];
+        if (!user) {
+            clearTwoFactorLoginChallenge(req);
+            return res.status(401).json({ error: 'Account no longer exists.' });
+        }
+        if (user.account_disabled && !isStaffRole(user.role)) {
+            clearTwoFactorLoginChallenge(req);
+            return res.status(403).json({
+                error: "This account has been disabled. \n Reason: " + (user.account_disabled_reason || "Banned"),
+                accountDisabled: true,
+            });
+        }
+
+        const method = String(challenge.method || '').toLowerCase();
+        if (!hasStoredTwoFactorMethod(user.two_factor_method, method)) {
+            clearTwoFactorLoginChallenge(req);
+            return res.status(401).json({ error: 'Your 2FA settings changed. Please sign in again.' });
+        }
+
+        let valid = false;
+        if (method === 'email') {
+            const expectedHash = hashTwoFactorCode(code, user.id, 'login');
+            valid = safeEqualText(expectedHash, challenge.codeHash);
+        } else if (method === 'app') {
+            try {
+                valid = verifyTotpCode(decryptTwoFactorSecret(user.two_factor_secret), code);
+            } catch (err) {
+                console.error('Authenticator verification error:', err);
+            }
+        }
+
+        if (!valid) {
+            const attempts = Number(challenge.attempts || 0) + 1;
+            if (attempts >= TWO_FACTOR_MAX_ATTEMPTS) {
+                clearTwoFactorLoginChallenge(req);
+                return res.status(401).json({ error: 'Too many incorrect codes. Please sign in again.' });
+            }
+            req.session.twoFactorLogin = { ...challenge, attempts };
+            return res.status(401).json({ error: 'Incorrect authentication code.' });
+        }
+
+        clearTwoFactorLoginChallenge(req);
+        req.session.userId = user.id;
+        req.session.username = user.username;
+        return res.json({ message: 'Logged in!', username: user.username });
+    } catch (err) {
+        console.error('Two-factor login error:', err);
+        return res.status(500).json({ error: 'Could not verify the authentication code.' });
+    }
+});
+
+app.post('/api/login/2fa/resend', async (req, res) => {
+    const challenge = req.session?.twoFactorLogin;
+    if (!challenge?.userId || challenge.method !== 'email' || challenge.expiresAt <= Date.now()) {
+        clearTwoFactorLoginChallenge(req);
+        return res.status(401).json({ error: 'Your authentication session expired. Please sign in again.' });
+    }
+    const elapsed = Date.now() - Number(challenge.lastSentAt || 0);
+    if (elapsed < TWO_FACTOR_RESEND_COOLDOWN_MS) {
+        return res.status(429).json({ error: `Please wait ${Math.ceil((TWO_FACTOR_RESEND_COOLDOWN_MS - elapsed) / 1000)} seconds before requesting another code.` });
+    }
+
+    try {
+        const result = await pool.query('SELECT id, username, email, two_factor_method FROM users WHERE id = $1', [challenge.userId]);
+        const user = result.rows[0];
+        if (!user || !hasStoredTwoFactorMethod(user.two_factor_method, 'email') || !user.email) {
+            clearTwoFactorLoginChallenge(req);
+            return res.status(401).json({ error: '2FA by email is no longer available for this account.' });
+        }
+        const code = generateEmailTwoFactorCode();
+        await sendTwoFactorCodeEmail(user.email, user.username, code, 'login');
+        req.session.twoFactorLogin = {
+            ...challenge,
+            codeHash: hashTwoFactorCode(code, user.id, 'login'),
+            expiresAt: Date.now() + TWO_FACTOR_CODE_TTL_MS,
+            lastSentAt: Date.now(),
+            attempts: 0,
+        };
+        return res.json({ message: `A new code was sent to ${maskEmailAddress(user.email)}.` });
+    } catch (err) {
+        console.error('Two-factor resend error:', err);
+        return res.status(500).json({ error: 'Could not send another code.' });
+    }
+});
+
+app.post('/api/login/2fa/cancel', (req, res) => {
+    clearTwoFactorLoginChallenge(req);
+    res.json({ message: 'Authentication cancelled.' });
+});
+
+app.get('/api/me', async (req, res) => {
+    if (req.session.userId) {
+        try {
+            const user = await pool.query(
+                'SELECT id, username, role, display_name, icon_type, icon_id, color1, color2, glow, leaderboard_banned, account_disabled, two_factor_method FROM users WHERE id = $1', 
+                [req.session.userId]
+            );
+
+            if (user.rows.length > 0) {
+                const userData = user.rows[0];
+                const clanTags = await getClanTagsForUsers(pool, [userData.id]);
+                const clanName = clanTags.get(Number(userData.id)) || '';
+                res.json({ 
+                    loggedIn: true, 
+                    username: userData.username, 
+                    role: userData.role,
+                    clanName,
+                    leaderboardBanned: Boolean(userData.leaderboard_banned),
+                    accountDisabled: Boolean(userData.account_disabled),
+                    twoFactorEnabled: hasAnyStoredTwoFactorMethod(userData.two_factor_method),
+                    displayName: formatClanDisplayName(userData.display_name || userData.username, clanName),
+                    icon: {
+                        type: userData.icon_type || 'cube',
+                        id: readProfileInt(userData.icon_id, 1),
+                        color1: readProfileInt(userData.color1, 12),
+                        color2: readProfileInt(userData.color2, 3),
+                        glow: readProfileInt(userData.glow, -1),
+                    },
+                });
+            } else {
+                res.json({ loggedIn: false });
+            }
+        } catch (err) {
+            console.error(err);
+            res.status(500).json({ error: "Database error" });
+        }
+    } else {
+        res.json({ loggedIn: false });
+    }
+});
+app.post('/api/logout', (req, res) => {
+    req.session = null;
+    res.json({ message: "Logged out" });
+});
+
+app.post('/api/submit', async (req, res) => {
+    if (!req.session.userId) {
+        return res.status(401).json({ error: "You must be logged in!" });
+    }
+
+    const { demonId, percentage, videoUrl, enjoymentRating, personalPlacement } = req.body;
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const newPercent = list === 'impossible'
+        ? Math.round(Number.parseFloat(percentage) * 100) / 100
+        : Number.parseInt(percentage, 10);
+    const normalizedEnjoyment = normalizeEnjoymentRating(enjoymentRating, newPercent);
+    const normalizedPersonalPlacement = normalizePersonalPlacement(personalPlacement, newPercent);
+    const comments = cleanProfileText(req.body.comments, 1000);
+    if (String(req.body.comments ?? '').trim().length > 1000) {
+        return res.status(400).json({ error: "Comments are limited to 1000 characters." });
+    }
+
+    if (list === 'impossible' && hasMoreThanTwoDecimalPlaces(percentage)) {
+        return res.status(400).json({ error: "WBiLL percentages are limited to 2 decimal places." });
+    }
+
+    if (!Number.isFinite(newPercent) || newPercent <= 0) {
+        return res.status(400).json({ error: "Percentage must be a valid number greater than 0%." });
+    }
+
+    if (newPercent > 100) {
+        return res.status(400).json({ error: "Percentage cannot be higher than 100%." });
+    }
+
+    if (list === 'impossible' && newPercent === 100) {
+        return res.status(400).json({ error: "You cannot submit a 100% record to the ILL. Submit a verification to the primary list instead." });
+    }
+
+    if (list !== 'impossible' && !Number.isInteger(newPercent)) {
+        return res.status(400).json({ error: "Main-list percentages must be whole numbers." });
+    }
+
+    if (enjoymentRating !== '' && enjoymentRating !== null && enjoymentRating !== undefined && normalizedEnjoyment === null) {
+        return res.status(400).json({ error: "Enjoyment rating must be between 1 and 10 and can only be used for 100% records." });
+    }
+
+    if (personalPlacement !== '' && personalPlacement !== null && personalPlacement !== undefined && normalizedPersonalPlacement === null) {
+        return res.status(400).json({ error: "Personal placement must be a whole number from 1 to 150 and can only be used for 100% records." });
+    }
+
+    const normalizedVideo = normalizeVideoSubmission(videoUrl);
+    if (!normalizedVideo) {
+        return res.status(400).json({ error: "Video link is not from an allowed domain." });
+    }
+
+    const client = await pool.connect();
+    let savedRecordId = null;
+    let isUpdate = false;
+    try {
+        await client.query('BEGIN');
+
+        const restriction = await getSubmissionRestriction(client, req.session.userId);
+        if (restriction) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: restriction });
+        }
+
+        const rateLimitError = await getNewAccountSubmissionRateLimit(client, req.session.userId);
+        if (rateLimitError) {
+            await client.query('ROLLBACK');
+            return res.status(429).json({ error: rateLimitError });
+        }
+
+        const demonQuery = await client.query(
+            'SELECT position, requirement, list_type, name FROM demons WHERE id = $1',
+            [demonId]
+        );
+
+        if (demonQuery.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "Level not found." });
+        }
+
+        const { position, requirement, list_type } = demonQuery.rows[0];
+
+        if (list_type === 'primary' && position > 150) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "Submissions for the Legacy List are disabled." });
+        }
+
+        if (list_type !== list) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "This level does not belong to the active list." });
+        }
+
+        if (list === 'primary') {
+            if (position > 75) {
+                if (newPercent < 100) {
+                    await client.query('ROLLBACK');
+                    return res.status(400).json({ error: "This level is on the Extended List, you must get 100% lol" });
+                }
+            } else if (newPercent < requirement) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: `Level requires at least ${requirement}%.` });
+            }
+        }
+
+        const existingRecord = await client.query(
+            `SELECT id, percentage FROM records
+             WHERE user_id = $1 AND demon_id = $2 AND list_type = $3 AND status != 'rejected'`,
+            [req.session.userId, demonId, list]
+        );
+
+        const activeRecord = existingRecord.rows[0] || null;
+        if (activeRecord && newPercent <= Number(activeRecord.percentage)) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+                error: `You already have an active ${activeRecord.percentage}% record. New entries must be a higher percentage.`
+            });
+        }
+
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [normalizedVideo.key]);
+        const canReuseOwnVideo = await canReuseOwnSubmissionVideo(client, req.session.userId);
+        const reuse = await findActiveVideoReuse(client, normalizedVideo.key, {
+            excludeRecordId: activeRecord ? Number(activeRecord.id) : null,
+            allowOwnUserId: canReuseOwnVideo ? req.session.userId : null,
+        });
+        if (reuse) {
+            await client.query('ROLLBACK');
+            return res.json({ message: activeRecord ? "That video has already been used." : "That video has already been used." });
+        }
+
+        if (activeRecord) {
+            savedRecordId = Number(activeRecord.id);
+            isUpdate = true;
+            await client.query(
+                `UPDATE records
+                 SET percentage = $1, video_url = $2, enjoyment_rating = $3, personal_placement = $4, submission_comments = $5, status = 'pending'
+                 WHERE id = $6`,
+                [newPercent, normalizedVideo.cleanUrl, normalizedEnjoyment, normalizedPersonalPlacement, comments || null, savedRecordId]
+            );
+        } else {
+            const insertedRecord = await client.query(
+                `INSERT INTO records (user_id, demon_id, percentage, video_url, enjoyment_rating, personal_placement, submission_comments, list_type, status)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+                 RETURNING id`,
+                [req.session.userId, demonId, newPercent, normalizedVideo.cleanUrl, normalizedEnjoyment, normalizedPersonalPlacement, comments || null, list]
+            );
+            savedRecordId = Number(insertedRecord.rows[0].id);
+        }
+
+        await client.query('COMMIT');
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error(err);
+        return res.status(500).json({ error: "Server error." });
+    } finally {
+        client.release();
+    }
+
+    await notifySubmissionSubscribers({
+        recordId: savedRecordId,
+        submitterId: req.session.userId,
+        demonId,
+        percentage: newPercent,
+        videoUrl: normalizedVideo.cleanUrl,
+        enjoymentRating: normalizedEnjoyment,
+        listType: list,
+        isUpdate,
+    });
+
+    if (isUpdate) {
+        const leaderboardSync = await syncLeaderboardTopOne(list);
+        for (const changedUserId of leaderboardSync.changedUserIds || []) {
+            await evaluateUserBadges(changedUserId, list);
+        }
+        return res.json({ message: "Record updated and awaiting review!" });
+    }
+
+    return res.json({ message: "Record submitted successfully!" });
+});
+
+
+app.get('/api/records/pending', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: "Unauthorized" });
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    try {
+        const result = await pool.query(`
+            SELECT r.id, r.demon_id, r.percentage, r.video_url, r.enjoyment_rating, r.personal_placement, r.submission_comments,
+                   r.created_at, d.name AS demon_name, d.position, d.requirement
+            FROM records r
+            JOIN demons d ON d.id = r.demon_id
+            WHERE r.user_id = $1 AND r.status = 'pending' AND r.list_type = $2
+            ORDER BY r.created_at DESC, r.id DESC
+        `, [req.session.userId, list]);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Pending record fetch error:', err);
+        res.status(500).json({ error: "Could not load pending records." });
+    }
+});
+
+app.get('/api/records/completed-ids', async (req, res) => {
+    if (!req.session.userId) return res.json([]);
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    try {
+        const result = await pool.query(`
+            SELECT DISTINCT demon_id
+            FROM records
+            WHERE user_id = $1
+              AND list_type = $2
+              AND status = 'accepted'
+              AND percentage = 100
+        `, [req.session.userId, list]);
+        res.json(result.rows.map(row => Number(row.demon_id)).filter(Number.isFinite));
+    } catch (err) {
+        console.error('Completed level id fetch error:', err);
+        res.status(500).json({ error: 'Could not load completed levels.' });
+    }
+});
+
+app.patch('/api/records/pending/:recordId', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: "Unauthorized" });
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const recordId = parseInt(req.params.recordId, 10);
+    const percentage = list === 'impossible'
+        ? Math.round(Number.parseFloat(req.body.percentage) * 100) / 100
+        : Number.parseInt(req.body.percentage, 10);
+    const normalizedVideo = normalizeVideoSubmission(req.body.videoUrl);
+    const enjoymentRating = normalizeEnjoymentRating(req.body.enjoymentRating, percentage);
+    const personalPlacement = normalizePersonalPlacement(req.body.personalPlacement, percentage);
+    const comments = cleanProfileText(req.body.comments, 1000);
+    if (String(req.body.comments ?? '').trim().length > 1000) {
+        return res.status(400).json({ error: "Comments are limited to 1000 characters." });
+    }
+
+    if (list === 'impossible' && hasMoreThanTwoDecimalPlaces(req.body.percentage)) {
+        return res.status(400).json({ error: "WBiLL percentages are limited to 2 decimal places." });
+    }
+
+    if (!Number.isInteger(recordId) || !Number.isFinite(percentage) || percentage < 1 || percentage > 100) {
+        return res.status(400).json({ error: "Percentage must be between 1 and 100." });
+    }
+    if (list === 'impossible' && percentage === 100) {
+        return res.status(400).json({ error: "You cannot submit a 100% record to the ILL. Submit a verification to the primary list instead." });
+    }
+    if (list !== 'impossible' && !Number.isInteger(percentage)) {
+        return res.status(400).json({ error: "Main-list percentages must be whole numbers." });
+    }
+    if (!normalizedVideo) {
+        return res.status(400).json({ error: "Video link is not from an allowed domain." });
+    }
+    if (req.body.enjoymentRating !== '' && req.body.enjoymentRating !== null && req.body.enjoymentRating !== undefined && enjoymentRating === null) {
+        return res.status(400).json({ error: "Enjoyment rating must be between 1 and 10 and can only be used for 100% records." });
+    }
+    if (req.body.personalPlacement !== '' && req.body.personalPlacement !== null && req.body.personalPlacement !== undefined && personalPlacement === null) {
+        return res.status(400).json({ error: "Personal placement must be a whole number from 1 to 150 and can only be used for 100% records." });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const restriction = await getSubmissionRestriction(client, req.session.userId);
+        if (restriction) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: restriction });
+        }
+
+        const recordResult = await client.query(`
+            SELECT r.id, d.position, d.requirement, d.list_type
+            FROM records r
+            JOIN demons d ON d.id = r.demon_id
+            WHERE r.id = $1 AND r.user_id = $2 AND r.status = 'pending' AND r.list_type = $3
+            FOR UPDATE OF r
+        `, [recordId, req.session.userId, list]);
+        const record = recordResult.rows[0];
+        if (!record) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "Pending record not found." });
+        }
+
+        if (list === 'primary') {
+            if (Number(record.position) > 150) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: "Legacy List submissions are disabled." });
+            }
+            if (Number(record.position) > 75 && percentage !== 100) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: "Extended List records must be 100%." });
+            }
+            if (Number(record.position) <= 75 && percentage < Number(record.requirement)) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: `This level requires at least ${record.requirement}%.` });
+            }
+        }
+
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [normalizedVideo.key]);
+        const canReuseOwnVideo = await canReuseOwnSubmissionVideo(client, req.session.userId);
+        const reuse = await findActiveVideoReuse(client, normalizedVideo.key, {
+            excludeRecordId: recordId,
+            allowOwnUserId: canReuseOwnVideo ? req.session.userId : null,
+        });
+        if (reuse) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: "That video has already been used." });
+        }
+
+        await client.query(`
+            UPDATE records
+            SET percentage = $1, video_url = $2, enjoyment_rating = $3, personal_placement = $4, submission_comments = $5
+            WHERE id = $6
+        `, [percentage, normalizedVideo.cleanUrl, enjoymentRating, personalPlacement, comments || null, recordId]);
+        await client.query('COMMIT');
+        return res.json({ message: "Pending record updated." });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Pending record update error:', err);
+        return res.status(500).json({ error: "Could not update pending record." });
+    } finally {
+        client.release();
+    }
+});
+
+
+app.delete('/api/records/pending/:recordId', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: "Unauthorized" });
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const recordId = parseInt(req.params.recordId, 10);
+    if (!Number.isInteger(recordId)) return res.status(400).json({ error: "Invalid record." });
+
+    try {
+        const result = await pool.query(`
+            DELETE FROM records
+            WHERE id = $1 AND user_id = $2 AND status = 'pending' AND list_type = $3
+            RETURNING id
+        `, [recordId, req.session.userId, list]);
+        if (!result.rows.length) return res.status(404).json({ error: "Pending record not found." });
+        res.json({ message: "Pending record deleted." });
+    } catch (err) {
+        console.error('Pending record delete error:', err);
+        res.status(500).json({ error: "Could not delete pending record." });
+    }
+});
+
+function isReadOnlyStaffRequest(req) {
+    return ['GET', 'HEAD', 'OPTIONS'].includes(String(req.method || '').toUpperCase());
+}
+
+async function requireStaffAccess(req, res, next, allowedRoles, errorLabel) {
+    if (!req.session.userId) return res.status(401).send('Not logged in');
+
+    try {
+        const user = await pool.query(
+            'SELECT role, two_factor_method FROM users WHERE id = $1',
+            [req.session.userId]
+        );
+        const row = user.rows[0];
+        const userRole = String(row?.role || '').toLowerCase();
+
+        if (!allowedRoles.includes(userRole)) {
+            return res.status(403).send('Access Denied :)');
+        }
+
+        const twoFactorEnabled = hasAnyStoredTwoFactorMethod(row?.two_factor_method);
+        if (!isReadOnlyStaffRequest(req) && !twoFactorEnabled) {
+            return res.status(403).json({
+                error: 'Staff must enable two-factor authentication before using moderator actions.',
+                twoFactorRequired: true,
+                securityUrl: '/account-settings#security',
+            });
+        }
+
+        next();
+    } catch (err) {
+        console.error(`${errorLabel} middleware error:`, err);
+        res.status(500).send('Internal Server Error');
+    }
+}
+
+const isOwner = (req, res, next) => requireStaffAccess(req, res, next, ['owner'], 'Owner auth');
+const isAdmin = (req, res, next) => requireStaffAccess(req, res, next, ['admin', 'owner'], 'Admin auth');
+const isMod = (req, res, next) => requireStaffAccess(req, res, next, ['moderator', 'admin', 'owner'], 'Mod auth');
+
+app.post('/api/owner/users/:userId/badges', isOwner, async (req, res) => {
+    const targetUserId = parseInt(req.params.userId, 10);
+    const groupId = String(req.body.groupId || '').trim();
+    const tierId = Number(req.body.tierId);
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    if (list === 'impossible') {
+        return res.status(404).json({ error: 'Badges are not available on the ILL.' });
+    }
+
+    if (!Number.isInteger(targetUserId) || !groupId || !Number.isInteger(tierId)) {
+        return res.status(400).json({ error: 'Invalid badge selection.' });
+    }
+
+    try {
+        const config = loadBadgeConfig();
+        const group = config.groups.find(item => String(item.id) === groupId);
+        const tier = (Array.isArray(group?.tiers) ? group.tiers : [])
+            .find(item => Number(item.id) === tierId);
+        if (!group || !tier) return res.status(404).json({ error: 'Badge not found.' });
+
+        const targetResult = await pool.query('SELECT id FROM users WHERE id = $1', [targetUserId]);
+        if (!targetResult.rows.length) return res.status(404).json({ error: 'User not found.' });
+
+        const badgeListType = group.scope === 'global' ? 'global' : list;
+        const badgeEntry = {
+            groupId,
+            tierId,
+            listType: badgeListType,
+            unlockedAt: new Date().toISOString(),
+            metadata: {
+                manuallyGranted: true,
+                grantedBy: Number(req.session.userId),
+            },
+        };
+
+        const inserted = await pool.query(`
+            UPDATE users
+            SET badges = COALESCE(badges, '[]'::jsonb) || $2::jsonb
+            WHERE id = $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements(COALESCE(badges, '[]'::jsonb)) AS stored(entry)
+                  WHERE stored.entry->>'groupId' = $3
+                    AND stored.entry->>'tierId' = $4
+                    AND COALESCE(stored.entry->>'listType', 'primary') = $5
+              )
+            RETURNING id
+        `, [targetUserId, JSON.stringify([badgeEntry]), groupId, String(tierId), badgeListType]);
+
+        if (!inserted.rows.length) {
+            return res.status(409).json({ error: 'This user already has that badge.' });
+        }
+
+        await createInboxNotification(pool, {
+            userId: targetUserId,
+            actorId: req.session.userId,
+            listType: list,
+            type: 'badge_unlocked',
+            senderName: 'WBDL',
+            subject: 'New Badge Unlocked!',
+            body: `You unlocked **${tier.name || `Badge ${tierId}`}**.\n\n${tier.description || ''}`,
+        });
+
+        res.json({ message: `${tier.name || 'Badge'} added.` });
+    } catch (err) {
+        console.error('Manual badge grant error:', err);
+        res.status(500).json({ error: 'Could not add badge.' });
+    }
+});
+
+app.get('/api/moderation/users/:userId', isMod, async (req, res) => {
+    const targetUserId = parseInt(req.params.userId, 10);
+    if (!Number.isInteger(targetUserId)) return res.status(400).json({ error: "Invalid user." });
+
+    try {
+        const [viewerResult, targetResult] = await Promise.all([
+            pool.query('SELECT id, username, role FROM users WHERE id = $1', [req.session.userId]),
+            pool.query(`
+                SELECT id, username, display_name, role, leaderboard_banned, leaderboard_ban_reason,
+                       account_disabled, account_disabled_reason
+                FROM users WHERE id = $1
+            `, [targetUserId]),
+        ]);
+
+        const viewer = viewerResult.rows[0];
+        const target = targetResult.rows[0];
+        if (!target) return res.status(404).json({ error: "User not found." });
+        if (!viewer || Number(viewer.id) === Number(target.id)) {
+            return res.status(403).json({ error: "You cannot moderate this account." });
+        }
+        if (!canModerateTargetRole(viewer.role, target.role)) {
+            return res.status(403).json({ error: "Only the owner can moderate staff members." });
+        }
+
+        res.json({
+            viewerRole: viewer?.role || '',
+            viewerId: viewer?.id || null,
+            target: {
+                ...target,
+                leaderboard_banned: Boolean(target.leaderboard_banned),
+                account_disabled: Boolean(target.account_disabled),
+                protectedFromBans: isStaffRole(target.role),
+            },
+        });
+    } catch (err) {
+        console.error('Moderation profile load error:', err);
+        res.status(500).json({ error: "Could not load moderation controls." });
+    }
+});
+
+app.post('/api/moderation/users/:userId/leaderboard-ban', isMod, async (req, res) => {
+    const targetUserId = parseInt(req.params.userId, 10);
+    if (typeof req.body.banned !== 'boolean') {
+        return res.status(400).json({ error: "The banned state must be true or false." });
+    }
+    const banned = req.body.banned;
+    const reason = cleanProfileText(req.body.reason, 1000);
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    if (!Number.isInteger(targetUserId)) return res.status(400).json({ error: "Invalid user." });
+
+    try {
+        const [actorResult, targetResult] = await Promise.all([
+            pool.query('SELECT username, role FROM users WHERE id = $1', [req.session.userId]),
+            pool.query('SELECT username, role FROM users WHERE id = $1', [targetUserId]),
+        ]);
+        const actor = actorResult.rows[0];
+        const target = targetResult.rows[0];
+        if (!target) return res.status(404).json({ error: "User not found." });
+        if (isStaffRole(target.role)) {
+            return res.status(403).json({ error: "Moderators, admins, and the owner are protected from leaderboard bans." });
+        }
+
+        await pool.query(`
+            UPDATE users
+            SET leaderboard_banned = $1,
+                leaderboard_ban_reason = $2,
+                leaderboard_banned_at = CASE WHEN $1 THEN NOW() ELSE NULL END,
+                leaderboard_banned_by = CASE WHEN $1 THEN $3::integer ELSE NULL END
+            WHERE id = $4
+        `, [banned, banned ? (reason || null) : null, req.session.userId, targetUserId]);
+
+        await createInboxNotification(pool, {
+            userId: targetUserId,
+            actorId: req.session.userId,
+            type: banned ? 'leaderboard_ban' : 'leaderboard_unban',
+            reason: reason || null,
+            listType: list,
+            subject: banned ? 'Leaderboard access suspended' : 'Leaderboard access restored',
+            body: banned
+                ? `You have been banned from the WBDL leaderboard.${reason ? `\n\n**Reason:** ${reason}` : ''}`
+                : 'Your leaderboard ban has been removed! Your records will count toward the leaderboard again.',
+        });
+
+        const sync = await syncLeaderboardTopOne(list);
+        for (const userId of new Set([targetUserId, ...(sync.changedUserIds || [])])) {
+            if (userId) await evaluateUserBadges(userId, list);
+        }
+        res.json({ message: banned ? "User leaderboard banned." : "Leaderboard ban removed." });
+    } catch (err) {
+        console.error('Leaderboard ban error:', err);
+        res.status(500).json({ error: "Could not update leaderboard ban." });
+    }
+});
+
+app.post('/api/admin/users/:userId/disable', isAdmin, async (req, res) => {
+    const targetUserId = parseInt(req.params.userId, 10);
+    if (typeof req.body.disabled !== 'boolean') {
+        return res.status(400).json({ error: "The disabled state must be true or false." });
+    }
+    const disabled = req.body.disabled;
+    const reason = cleanProfileText(req.body.reason, 1000);
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    if (!Number.isInteger(targetUserId)) return res.status(400).json({ error: "Invalid user." });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const targetResult = await client.query('SELECT username, role FROM users WHERE id = $1 FOR UPDATE', [targetUserId]);
+        const target = targetResult.rows[0];
+        if (!target) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "User not found." });
+        }
+        if (isStaffRole(target.role)) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: "Moderators, admins, and the owner cannot be disabled." });
+        }
+
+        await client.query(`
+            UPDATE users
+            SET account_disabled = $1,
+                account_disabled_reason = $2,
+                account_disabled_at = CASE WHEN $1 THEN NOW() ELSE NULL END,
+                account_disabled_by = CASE WHEN $1 THEN $3::integer ELSE NULL END
+            WHERE id = $4
+        `, [disabled, disabled ? (reason || null) : null, req.session.userId, targetUserId]);
+
+        if (disabled) {
+            await client.query(`
+                DELETE FROM notifications
+                WHERE user_id = $1
+                   OR actor_id = $1
+                   OR record_id IN (
+                        SELECT id
+                        FROM records
+                        WHERE user_id = $1 AND status IN ('pending', 'rejected')
+                   )
+            `, [targetUserId]);
+
+            await client.query(`
+                DELETE FROM records
+                WHERE user_id = $1 AND status IN ('pending', 'rejected')
+            `, [targetUserId]);
+
+            await client.query(`
+                DELETE FROM verifications
+                WHERE user_id = $1 AND status IN ('pending', 'rejected')
+            `, [targetUserId]);
+        }
+
+        await client.query('COMMIT');
+
+        if (!disabled) {
+            await createInboxNotification(pool, {
+                userId: targetUserId,
+                actorId: req.session.userId,
+                type: 'account_enabled',
+                reason: reason || null,
+                listType: list,
+                subject: 'Account re-enabled',
+                body: 'Your WBDL account has been re-enabled!',
+            });
+        }
+
+        const sync = await syncLeaderboardTopOne(list);
+        for (const userId of new Set([targetUserId, ...(sync.changedUserIds || [])])) {
+            if (userId) await evaluateUserBadges(userId, list);
+        }
+        return res.json({ message: disabled ? "Account disabled." : "Account re-enabled." });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Account disable error:', err);
+        return res.status(500).json({ error: "Could not update account state." });
+    } finally {
+        client.release();
+    }
+});
+
+function makeResetAccountUsername() {
+    const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    const bytes = randomBytes(10);
+    let suffix = '';
+    for (let i = 0; i < 10; i++) suffix += alphabet[bytes[i] % alphabet.length];
+    return `acc_${suffix}`;
+}
+
+app.post('/api/owner/users/:userId/reset', isOwner, async (req, res) => {
+    const targetUserId = Number.parseInt(req.params.userId, 10);
+    if (!Number.isInteger(targetUserId)) return res.status(400).json({ error: 'Invalid user.' });
+    if (Number(req.session.userId) === targetUserId) {
+        return res.status(400).json({ error: 'You cannot reset your own account.' });
+    }
+
+    const client = await pool.connect();
+    let newUsername = null;
+    try {
+        await client.query('BEGIN');
+        const targetResult = await client.query(`
+            SELECT id, username, role, COALESCE(account_disabled, FALSE) AS account_disabled
+            FROM users
+            WHERE id = $1
+            FOR UPDATE
+        `, [targetUserId]);
+        const target = targetResult.rows[0];
+        if (!target) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'User not found.' });
+        }
+        if (isStaffRole(target.role)) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'Staff accounts cannot be reset.' });
+        }
+        if (!target.account_disabled) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'The account must be disabled before it can be reset.' });
+        }
+
+        for (let attempt = 0; attempt < 20; attempt++) {
+            const candidate = makeResetAccountUsername();
+            const duplicate = await client.query(`
+                SELECT 1 FROM users WHERE LOWER(username) = LOWER($1)
+                UNION ALL
+                SELECT 1 FROM pending_users WHERE LOWER(username) = LOWER($1)
+                LIMIT 1
+            `, [candidate]);
+            if (!duplicate.rows.length) {
+                newUsername = candidate;
+                break;
+            }
+        }
+        if (!newUsername) throw new Error('Could not generate a unique reset username.');
+
+        await client.query(`
+            DELETE FROM notifications
+            WHERE user_id = $1 OR actor_id = $1
+        `, [targetUserId]);
+
+        await client.query('DELETE FROM records WHERE user_id = $1', [targetUserId]);
+
+        await client.query(`
+            UPDATE users
+            SET username = $1,
+                display_name = '',
+                bio = '',
+                pronouns = '',
+                country = '',
+                social_youtube = '',
+                social_twitter = '',
+                social_twitch = '',
+                social_discord = '',
+                social_reddit = '',
+                social_gdbrowser = '',
+                discord_id = NULL,
+                discord_username = NULL,
+                icon_type = 'cube',
+                icon_id = 1,
+                color1 = 1,
+                color2 = 3,
+                glow = -1,
+                badges = '[]'::jsonb,
+                submission_notifications = FALSE,
+                submission_discord_ping = FALSE,
+                verification_notifications = FALSE,
+                verification_discord_ping = FALSE,
+                two_factor_method = NULL,
+                two_factor_secret = NULL,
+                two_factor_enabled_at = NULL
+            WHERE id = $2
+        `, [newUsername, targetUserId]);
+
+        await client.query('COMMIT');
+
+        for (const list of ['primary', 'impossible']) {
+            const sync = await syncLeaderboardTopOne(list);
+            for (const changedUserId of sync.changedUserIds || []) {
+                if (changedUserId) await evaluateUserBadges(changedUserId, list);
+            }
+        }
+
+        return res.json({
+            message: `Account reset. New username: ${newUsername}`,
+            username: newUsername,
+        });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Account reset error:', err);
+        return res.status(500).json({ error: 'Could not reset the account.' });
+    } finally {
+        client.release();
+    }
+});
+
+app.post('/api/owner/users/:userId/role', isOwner, async (req, res) => {
+    const targetUserId = parseInt(req.params.userId, 10);
+    const requestedRole = String(req.body.role || '').trim().toLowerCase();
+    const reason = cleanProfileText(req.body.reason, 1000);
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    if (!Number.isInteger(targetUserId)) {
+        return res.status(400).json({ error: 'Invalid user.' });
+    }
+    if (!['member', 'moderator', 'admin'].includes(requestedRole)) {
+        return res.status(400).json({ error: 'Invalid role.' });
+    }
+    if (Number(req.session.userId) === targetUserId) {
+        return res.status(400).json({ error: 'You cannot change your own role.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const targetResult = await client.query(
+            'SELECT id, username, role FROM users WHERE id = $1 FOR UPDATE',
+            [targetUserId]
+        );
+        const target = targetResult.rows[0];
+
+        if (!target) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'User not found.' });
+        }
+
+        const currentRole = String(target.role || 'member').toLowerCase();
+        const normalizedCurrentRole = currentRole === 'user' ? 'member' : currentRole;
+
+        if (normalizedCurrentRole === 'owner') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'The owner account role cannot be changed.' });
+        }
+        if (normalizedCurrentRole === requestedRole) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: `This user is already a ${requestedRole}.` });
+        }
+
+        await client.query(`
+            UPDATE users
+            SET role = $1,
+                leaderboard_banned = FALSE,
+                leaderboard_ban_reason = NULL,
+                leaderboard_banned_at = NULL,
+                leaderboard_banned_by = NULL,
+                account_disabled = FALSE,
+                account_disabled_reason = NULL,
+                account_disabled_at = NULL,
+                account_disabled_by = NULL
+            WHERE id = $2
+        `, [requestedRole, targetUserId]);
+
+        const roleLabel = requestedRole.charAt(0).toUpperCase() + requestedRole.slice(1);
+        const roleRanks = { member: 0, moderator: 1, admin: 2 };
+        const roleChangeType = roleRanks[requestedRole] > (roleRanks[normalizedCurrentRole] ?? 0)
+            ? 'promoted'
+            : 'demoted';
+        await createInboxNotification(client, {
+            userId: targetUserId,
+            actorId: req.session.userId,
+            type: 'role_changed',
+            reason: reason || null,
+            listType: list,
+            subject: `You have been ${roleChangeType} to ${roleLabel}`,
+            body: `Your WBDL account role was changed to **${roleLabel}**.${reason ? `\n\n**Reason:** ${reason}` : ''}`,
+        });
+
+        for (const listType of ['primary', 'impossible']) {
+            const sync = await syncLeaderboardTopOne(listType, client);
+            for (const userId of new Set([targetUserId, ...(sync.changedUserIds || [])])) {
+                if (userId) await evaluateUserBadges(userId, listType, client);
+            }
+        }
+
+        await client.query('COMMIT');
+
+        res.json({
+            message: `${target.username}'s role was changed to ${roleLabel}.`,
+            role: requestedRole,
+        });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Role change error:', err);
+        res.status(500).json({ error: 'Could not change this user role.' });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/admin/users/:userId/username', isAdmin, async (req, res) => {
+    const targetUserId = parseInt(req.params.userId, 10);
+    const username = String(req.body.username || '').trim();
+    const reason = cleanProfileText(req.body.reason, 1000);
+    if (!Number.isInteger(targetUserId)) return res.status(400).json({ error: "Invalid user." });
+    const formatError = validateUsername(username);
+    if (formatError) return res.status(400).json({ error: formatError });
+
+    try {
+        const [actorResult, targetResult, duplicate] = await Promise.all([
+            pool.query('SELECT role FROM users WHERE id = $1', [req.session.userId]),
+            pool.query('SELECT username, role FROM users WHERE id = $1', [targetUserId]),
+            pool.query('SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id != $2', [username, targetUserId]),
+        ]);
+        const actorRole = actorResult.rows[0]?.role;
+        const target = targetResult.rows[0];
+        if (!target) return res.status(404).json({ error: "User not found." });
+        if (!canModerateTargetRole(actorRole, target.role)) {
+            return res.status(403).json({ error: "Only the owner can moderate staff members." });
+        }
+        if (duplicate.rows.length) return res.status(400).json({ error: "That username is already taken." });
+
+        await pool.query('UPDATE users SET username = $1 WHERE id = $2', [username, targetUserId]);
+        await createInboxNotification(pool, {
+            userId: targetUserId,
+            actorId: req.session.userId,
+            type: 'username_moderated',
+            subject: 'Your username was moderated.',
+            body: `Your username was changed from **${target.username}** to **${username}**.${reason ? `\n\n**Reason:** ${reason}` : ''}`,
+        });
+        res.json({ message: "Username updated.", username });
+    } catch (err) {
+        console.error('Username moderation error:', err);
+        res.status(500).json({ error: "Could not update username." });
+    }
+});
+
+app.patch('/api/admin/users/:userId/records/:recordId', isAdmin, async (req, res) => {
+    const targetUserId = parseInt(req.params.userId, 10);
+    const recordId = parseInt(req.params.recordId, 10);
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const percentage = list === 'impossible'
+        ? Math.round(Number.parseFloat(req.body.percentage) * 100) / 100
+        : Number.parseInt(req.body.percentage, 10);
+    const videoUrl = String(req.body.videoUrl || '').trim();
+    const normalizedVideo = normalizeVideoSubmission(videoUrl);
+    const status = String(req.body.status || '').toLowerCase();
+    const reason = cleanProfileText(req.body.reason, 1000);
+    const enjoymentRating = normalizeEnjoymentRating(req.body.enjoymentRating, percentage);
+
+    if (list === 'impossible' && hasMoreThanTwoDecimalPlaces(req.body.percentage)) {
+        return res.status(400).json({ error: "Percentages are limited to 2 decimal places." });
+    }
+
+    if (!Number.isInteger(targetUserId) || !Number.isInteger(recordId)) return res.status(400).json({ error: "Invalid record." });
+    if (!Number.isFinite(percentage) || percentage < 1 || percentage > 100) return res.status(400).json({ error: "Percentage must be between 1 and 100." });
+    if (list !== 'impossible' && !Number.isInteger(percentage)) return res.status(400).json({ error: "Main-list percentages must be whole numbers." });
+    if (!normalizedVideo) return res.status(400).json({ error: "Video link is not from an allowed domain." });
+    if (!['pending', 'accepted', 'rejected'].includes(status)) return res.status(400).json({ error: "Invalid status." });
+    if (req.body.enjoymentRating !== '' && req.body.enjoymentRating !== null && req.body.enjoymentRating !== undefined && enjoymentRating === null) {
+        return res.status(400).json({ error: "Enjoyment rating must be 1-10 and only applies to 100% records." });
+    }
+
+    try {
+        const [actorResult, targetResult] = await Promise.all([
+            pool.query('SELECT role FROM users WHERE id = $1', [req.session.userId]),
+            pool.query('SELECT role FROM users WHERE id = $1', [targetUserId]),
+        ]);
+        const targetRole = targetResult.rows[0]?.role;
+        if (!targetResult.rows.length) return res.status(404).json({ error: "User not found." });
+        if (!canModerateTargetRole(actorResult.rows[0]?.role, targetRole)) {
+            return res.status(403).json({ error: "Only the owner can moderate staff members." });
+        }
+
+        const recordResult = await pool.query(`
+            SELECT r.id, r.user_id, r.status AS old_status, d.name AS demon_name, d.position
+            FROM records r
+            JOIN demons d ON d.id = r.demon_id
+            WHERE r.id = $1 AND r.user_id = $2 AND r.list_type = $3
+        `, [recordId, targetUserId, list]);
+        const record = recordResult.rows[0];
+        if (!record) return res.status(404).json({ error: "Record not found." });
+
+        await pool.query(`
+            UPDATE records
+            SET percentage = $1,
+                video_url = $2,
+                enjoyment_rating = $3,
+                status = $4,
+                accepted_position = CASE WHEN $4 = 'accepted' THEN $5 ELSE accepted_position END
+            WHERE id = $6
+        `, [percentage, normalizedVideo.cleanUrl, enjoymentRating, status, record.position, recordId]);
+
+        if (record.old_status === 'pending' && ['accepted', 'rejected'].includes(status)) {
+            await logModerationAction(pool, {
+                moderatorId: req.session.userId,
+                submissionType: 'record',
+                decision: status,
+                listType: list,
+                submissionId: recordId,
+                submitterId: targetUserId,
+            });
+        }
+
+        await createInboxNotification(pool, {
+            userId: targetUserId,
+            actorId: req.session.userId,
+            recordId,
+            type: 'record_edited',
+            reason: reason || null,
+            listType: list,
+            subject: `Record edited: ${record.demon_name}`,
+            body: `A staff member edited your record for **${record.demon_name}**.\n\n- Percentage: **${percentage}%**\n- Status: **${status}**${enjoymentRating ? `\n- Enjoyment: **${enjoymentRating}/10**` : ''}${reason ? `\n\n**Reason:** ${reason}` : ''}`,
+        });
+
+        const sync = await syncLeaderboardTopOne(list);
+        for (const userId of new Set([targetUserId, ...(sync.changedUserIds || [])])) {
+            if (userId) await evaluateUserBadges(userId, list);
+        }
+        res.json({ message: "Record updated." });
+    } catch (err) {
+        console.error('Admin record edit error:', err);
+        res.status(500).json({ error: "Could not update record." });
+    }
+});
+
+app.delete('/api/admin/users/:userId/records/:recordId', isAdmin, async (req, res) => {
+    const targetUserId = parseInt(req.params.userId, 10);
+    const recordId = parseInt(req.params.recordId, 10);
+    const reason = cleanProfileText(req.body?.reason, 1000);
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    if (!Number.isInteger(targetUserId) || !Number.isInteger(recordId)) return res.status(400).json({ error: "Invalid record." });
+
+    try {
+        const [actorResult, targetResult] = await Promise.all([
+            pool.query('SELECT role FROM users WHERE id = $1', [req.session.userId]),
+            pool.query('SELECT role FROM users WHERE id = $1', [targetUserId]),
+        ]);
+        const targetRole = targetResult.rows[0]?.role;
+        if (!targetResult.rows.length) return res.status(404).json({ error: "User not found." });
+        if (!canModerateTargetRole(actorResult.rows[0]?.role, targetRole)) {
+            return res.status(403).json({ error: "Only the owner can moderate staff members." });
+        }
+
+        const recordResult = await pool.query(`
+            SELECT r.id, d.name AS demon_name
+            FROM records r
+            JOIN demons d ON d.id = r.demon_id
+            WHERE r.id = $1 AND r.user_id = $2 AND r.list_type = $3
+        `, [recordId, targetUserId, list]);
+        const record = recordResult.rows[0];
+        if (!record) return res.status(404).json({ error: "Record not found." });
+
+        await pool.query('DELETE FROM records WHERE id = $1', [recordId]);
+        await createInboxNotification(pool, {
+            userId: targetUserId,
+            actorId: req.session.userId,
+            type: 'record_deleted',
+            reason: reason || null,
+            listType: list,
+            subject: `Record removed: ${record.demon_name}`,
+            body: `A staff member removed your record for **${record.demon_name}**.${reason ? `\n\n**Reason:** ${reason}` : ''}`,
+        });
+
+        const sync = await syncLeaderboardTopOne(list);
+        for (const userId of new Set([targetUserId, ...(sync.changedUserIds || [])])) {
+            if (userId) await evaluateUserBadges(userId, list);
+        }
+        res.json({ message: "Record deleted." });
+    } catch (err) {
+        console.error('Admin record delete error:', err);
+        res.status(500).json({ error: "Could not delete record." });
+    }
+});
+
+app.get('/api/moderation/submission-notification-settings', isMod, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                COALESCE(submission_notifications, FALSE) AS submission_notifications,
+                COALESCE(submission_discord_ping, FALSE) AS submission_discord_ping,
+                discord_id IS NOT NULL AS discord_linked
+            FROM users
+            WHERE id = $1
+        `, [req.session.userId]);
+        const settings = result.rows[0];
+        if (!settings) return res.status(404).json({ error: 'User not found.' });
+
+        res.json({
+            submissionNotifications: Boolean(settings.submission_notifications),
+            discordPing: Boolean(settings.submission_discord_ping),
+            discordLinked: Boolean(settings.discord_linked),
+        });
+    } catch (err) {
+        console.error('Submission notification settings load error:', err);
+        res.status(500).json({ error: 'Could not load notification settings.' });
+    }
+});
+
+app.patch('/api/moderation/submission-notification-settings', isMod, async (req, res) => {
+    const { submissionNotifications, discordPing } = req.body;
+    if (typeof submissionNotifications !== 'boolean' || typeof discordPing !== 'boolean') {
+        return res.status(400).json({ error: 'Notification settings must be true or false.' });
+    }
+    try {
+        const userResult = await pool.query(
+            'SELECT discord_id FROM users WHERE id = $1',
+            [req.session.userId]
+        );
+        const user = userResult.rows[0];
+        if (!user) return res.status(404).json({ error: 'User not found.' });
+        if (discordPing && !user.discord_id) {
+            return res.status(400).json({ error: 'Link your Discord account before enabling Discord Ping.' });
+        }
+
+        await pool.query(`
+            UPDATE users
+            SET submission_notifications = $1,
+                submission_discord_ping = $2
+            WHERE id = $3
+        `, [submissionNotifications, discordPing, req.session.userId]);
+
+        res.json({
+            submissionNotifications,
+            discordPing,
+            discordLinked: Boolean(user.discord_id),
+        });
+    } catch (err) {
+        console.error('Submission notification settings update error:', err);
+        res.status(500).json({ error: 'Could not update notification settings.' });
+    }
+});
+
+
+app.get('/api/admin/verification-notification-settings', isAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT
+                COALESCE(verification_notifications, FALSE) AS verification_notifications,
+                COALESCE(verification_discord_ping, FALSE) AS verification_discord_ping,
+                COALESCE(verification_notification_max_position, 150) AS verification_notification_max_position,
+                discord_id IS NOT NULL AS discord_linked
+            FROM users
+            WHERE id = $1
+        `, [req.session.userId]);
+        const settings = result.rows[0];
+        if (!settings) return res.status(404).json({ error: 'User not found.' });
+
+        res.json({
+            verificationNotifications: Boolean(settings.verification_notifications),
+            discordPing: Boolean(settings.verification_discord_ping),
+            maxPosition: Math.min(150, Math.max(1, Number(settings.verification_notification_max_position) || 150)),
+            discordLinked: Boolean(settings.discord_linked),
+        });
+    } catch (err) {
+        console.error('Verification notification settings load error:', err);
+        res.status(500).json({ error: 'Could not load verification notification settings.' });
+    }
+});
+
+app.patch('/api/admin/verification-notification-settings', isAdmin, async (req, res) => {
+    const { verificationNotifications, discordPing } = req.body;
+    const maxPosition = Number.parseInt(req.body?.maxPosition, 10);
+
+    if (typeof verificationNotifications !== 'boolean' || typeof discordPing !== 'boolean') {
+        return res.status(400).json({ error: 'Notification settings must be true or false.' });
+    }
+    if (!Number.isInteger(maxPosition) || maxPosition < 1 || maxPosition > 150) {
+        return res.status(400).json({ error: 'Verification notification range must be between 1 and 150.' });
+    }
+
+    try {
+        const userResult = await pool.query(
+            'SELECT discord_id FROM users WHERE id = $1',
+            [req.session.userId]
+        );
+        const user = userResult.rows[0];
+        if (!user) return res.status(404).json({ error: 'User not found.' });
+        if (discordPing && !user.discord_id) {
+            return res.status(400).json({ error: 'Link your Discord account before enabling Discord Ping.' });
+        }
+
+        await pool.query(`
+            UPDATE users
+            SET verification_notifications = $1,
+                verification_discord_ping = $2,
+                verification_notification_max_position = $3
+            WHERE id = $4
+        `, [verificationNotifications, discordPing, maxPosition, req.session.userId]);
+
+        res.json({
+            verificationNotifications,
+            discordPing,
+            maxPosition,
+            discordLinked: Boolean(user.discord_id),
+        });
+    } catch (err) {
+        console.error('Verification notification settings update error:', err);
+        res.status(500).json({ error: 'Could not update verification notification settings.' });
+    }
+});
+
+app.get('/api/admin/pending', isMod, async (req, res) => {
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    try {
+        const result = await pool.query(`
+            SELECT records.*, users.username, demons.name as demon_name 
+            FROM records 
+            JOIN users ON records.user_id = users.id 
+            JOIN demons ON records.demon_id = demons.id 
+            WHERE records.status = 'pending' AND records.list_type = $1
+            ORDER BY records.id ASC
+        `, [list]);
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to fetch pending records" });
+    }
+});
+
+app.post('/api/admin/update-record', isMod, async (req, res) => {
+    const { recordId, status, reason } = req.body;
+    const note = cleanProfileText(req.body.note, 2000);
+    const actorId = req.session.userId;
+    const activeSubdomainList = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    if (!['accepted', 'rejected'].includes(status)) {
+        return res.status(400).json({ error: "Invalid record status." });
+    }
+
+    const client = await pool.connect();
+    let targetUserId = null;
+    let listType = activeSubdomainList;
+
+    try {
+        await client.query('BEGIN');
+        const actorQuery = await client.query('SELECT username, role FROM users WHERE id = $1', [actorId]);
+        const actor = actorQuery.rows[0];
+
+        const recordQuery = await client.query(`
+            SELECT r.user_id, r.list_type, r.percentage, d.name AS demon_name, d.position,
+                   u.username AS target_username, u.role AS target_role
+            FROM records r
+            JOIN demons d ON d.id = r.demon_id
+            JOIN users u ON u.id = r.user_id
+            WHERE r.id = $1
+            FOR UPDATE OF r
+        `, [recordId]);
+
+        if (!recordQuery.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "Record not found" });
+        }
+
+        const record = recordQuery.rows[0];
+        targetUserId = record.user_id;
+        listType = record.list_type;
+
+        if (record.list_type !== activeSubdomainList) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "This record does not belong to the active list." });
+        }
+
+        if (!canReviewSubmission(actorId, record.user_id, actor?.role)) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: "You cannot review your own record." });
+        }
+
+        const updateResult = await client.query(`
+            UPDATE records
+            SET status = $1,
+                accepted_position = CASE
+                    WHEN $1 = 'accepted' THEN $2
+                    ELSE accepted_position
+                END
+            WHERE id = $3
+              AND status = 'pending'
+            RETURNING id
+        `, [status, record.position, recordId]);
+
+        if (!updateResult.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                error: "Another mod took care of this record first xd"
+            });
+        }
+
+        await logModerationAction(client, {
+            moderatorId: actorId,
+            submissionType: 'record',
+            decision: status,
+            listType: record.list_type,
+            submissionId: Number(recordId),
+            submitterId: record.user_id,
+        });
+
+        const accepted = status === 'accepted';
+        const body = accepted
+            ? `Your **${record.percentage}%** record for **${record.demon_name}** was accepted.${note ? `\n\n**Note from moderator:** ${note}` : ''}`
+            : `Your **${record.percentage}%** record for **${record.demon_name}** was rejected.${reason ? `\n\n**Reason:** ${reason}` : ''}`;
+
+        await createInboxNotification(client, {
+            userId: record.user_id,
+            actorId,
+            recordId,
+            type: status,
+            reason: accepted ? (note || null) : (reason || null),
+            listType: record.list_type,
+            subject: `Record ${status}: ${record.demon_name}`,
+            body,
+        });
+
+        await client.query('COMMIT');
+
+        const sync = await syncLeaderboardTopOne(listType);
+        const affected = new Set([Number(targetUserId), ...(sync.changedUserIds || []).map(Number)]);
+        for (const userId of affected) {
+            if (userId) await evaluateUserBadges(userId, listType);
+        }
+
+        res.json({ message: `Record ${status}.` });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error(err);
+        res.status(500).json({ error: "Failed to update record" });
+    } finally {
+        client.release();
+    }
+});
+
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const ILL_DISCORD_WEBHOOK_URL = process.env.ILL_DISCORD_WEBHOOK_URL;
+
+async function sendDiscordNotification(content, list = 'primary') {
+    const isILL = list === 'impossible';
+    const webhookUrl = isILL ? ILL_DISCORD_WEBHOOK_URL : DISCORD_WEBHOOK_URL;
+    
+    if (!webhookUrl) return;
+    
+    const username = isILL ? "Impossible List Changes" : "List Changes";
+    const avatarUrl = isILL ? "https://webdemonlist.org/assets/impossible.png" : "https://webdemonlist.org/assets/icon.png";
+    const roleId = isILL ? "1531774623052599539" : "1493780241628528730";
+
+    try {
+        await fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                username: username,
+                avatar_url: avatarUrl,
+                content: `<@&${roleId}> ${content}`
+            })
+        });
+    } catch (err) {
+        console.error("Discord notification failed:", err);
+    }
+}
+
+app.post('/api/admin/add-demon', isAdmin, async (req, res) => {
+    const { name, author, position, level_id, requirement, showcase_url } = req.body;
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const actorId = req.session.userId;
+    const targetPos = parseInt(position);
+
+    const client = await pool.connect();
+
+    try {
+        const userRes = await client.query('SELECT role FROM users WHERE id = $1', [actorId]);
+        const userRole = userRes.rows[0]?.role;
+
+        if (targetPos > 150) {
+            client.release();
+            return res.status(403).json({ error: "Levels cannot be placed in the legacy list." });
+        }
+
+        await client.query('BEGIN');
+
+        const boundaries = await client.query(
+            `SELECT position, name FROM demons WHERE list_type = $1 AND position IN (75, 150)`,
+            [list]
+        );
+        const old75 = boundaries.rows.find(r => r.position === 75)?.name;
+        const old150 = boundaries.rows.find(r => r.position === 150)?.name;
+
+        await client.query(
+            'UPDATE demons SET position = position + 1 WHERE list_type = $2 AND position >= $1', 
+            [targetPos, list]
+        );
+
+        const newLevel = await client.query(
+            `INSERT INTO demons (name, author, position, level_id, requirement, list_type, showcase_url) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+            [name, author, targetPos, level_id, requirement || 0, list, showcase_url || null]
+        );
+        const newDemonId = newLevel.rows[0].id;
+
+        await client.query(
+            `INSERT INTO changelog (demon_id, demon_name, change_type, old_position, new_position, list_type) 
+             VALUES ($1, $2, 'added', null, $3, $4)`,
+            [newDemonId, name, targetPos, list]
+        );
+
+        const neighborsRes = await client.query(
+            `SELECT name, position FROM demons WHERE list_type = $1 AND position IN ($2, $3)`,
+            [list, targetPos - 1, targetPos + 1]
+        );
+        
+        await client.query('COMMIT');
+
+        const above = neighborsRes.rows.find(r => r.position == targetPos - 1)?.name;
+        const below = neighborsRes.rows.find(r => r.position == targetPos + 1)?.name;
+
+        let msg = `**${name}** has been placed at **#${targetPos}**`;
+        let context = [];
+        
+        if (below) context.push(`above **${below}**`);
+        if (above) context.push(`below **${above}**`);
+
+        if (context.length > 0) msg += ", " + context.join(" and ");
+
+        if (list === 'primary') {
+            msg += ` with a list requirement of **${requirement}%**.`;
+
+            let pushes = [];
+            if (targetPos <= 75 && old75) pushes.push(`**${old75}** into the Extended List`);
+            if (targetPos <= 150 && old150) pushes.push(`**${old150}** into the Legacy List`);
+            
+            if (pushes.length > 0) {
+                msg += ` This change pushes ${pushes.join(" and ")}.`;
+            }
+        } else {
+            msg += `.`;
+        }
+
+        sendDiscordNotification(msg, list);
+
+        const leaderboardSync = await syncLeaderboardTopOne(list);
+        for (const changedUserId of leaderboardSync.changedUserIds || []) {
+            await evaluateUserBadges(changedUserId, list);
+        }
+
+        res.json({ message: "Demon added" });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err);
+        res.status(500).json({ error: "Add failed: " + err.message });
+    } finally {
+        client.release();
+    }
+});
+
+app.post('/api/admin/delete-demon', isOwner, async (req, res) => {
+    const { id, position } = req.body;
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const actorId = req.session.userId;
+    const targetPos = parseInt(position);
+
+    const client = await pool.connect();
+
+    try {
+        const userRes = await client.query('SELECT role FROM users WHERE id = $1', [actorId]);
+        const userRole = userRes.rows[0]?.role;
+
+        if (targetPos > 150 && userRole !== 'owner') {
+            client.release();
+            return res.status(403).json({ error: "Can't delete levels from the Legacy List." });
+        }
+
+        await client.query('BEGIN');
+
+        const boundaries = await client.query(
+            `SELECT position, name FROM demons WHERE list_type = $1 AND position IN (76, 151)`,
+            [list]
+        );
+        const old76 = boundaries.rows.find(r => r.position === 76)?.name;
+        const old151 = boundaries.rows.find(r => r.position === 151)?.name;
+
+        const levelData = await client.query('SELECT name, list_type FROM demons WHERE id = $1', [id]);
+        if (levelData.rows.length === 0) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(404).json({ error: "Level not found" });
+        }
+
+        const { name: levelName, list_type } = levelData.rows[0];
+
+        if (list_type !== list) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(400).json({ error: "This level does not belong to the active list layout." });
+        }
+
+        await client.query('DELETE FROM records WHERE demon_id = $1', [id]);
+        
+        await client.query('DELETE FROM demons WHERE id = $1', [id]);
+        
+        await client.query(
+            'UPDATE demons SET position = position - 1 WHERE list_type = $2 AND position > $1', 
+            [targetPos, list]
+        );
+
+        await client.query(
+            `INSERT INTO changelog (demon_id, demon_name, change_type, old_position, new_position, list_type) 
+             VALUES ($1, $2, 'deleted', $3, null, $4)`,
+            [id, levelName, targetPos, list]
+        );
+        
+        await client.query('COMMIT');
+
+        let msg = `**${levelName}** has been removed from the list.`;
+
+        if (list === 'primary') {
+            let pushes = [];
+            if (targetPos <= 75 && old76) pushes.push(`**${old76}** back to the Main List`);
+            if (targetPos <= 150 && old151) pushes.push(`**${old151}** back to the Extended List`);
+            
+            if (pushes.length > 0) {
+                msg += ` This change pushes ${pushes.join(" and ")}.`;
+            }
+        }
+
+        sendDiscordNotification(msg, list);
+
+        const leaderboardSync = await syncLeaderboardTopOne(list);
+        for (const changedUserId of leaderboardSync.changedUserIds || []) {
+            await evaluateUserBadges(changedUserId, list);
+        }
+
+        res.json({ message: "Demon removed" });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err);
+        res.status(500).json({ error: "Delete failed" });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/admin/demons/:id/banner', isAdmin, async (req, res) => {
+    const demonId = parseInt(req.params.id, 10);
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const rawBannerUrl = String(req.body?.bannerUrl ?? '').trim();
+
+    if (!Number.isInteger(demonId)) {
+        return res.status(400).json({ error: 'Invalid level.' });
+    }
+
+    let bannerUrl = null;
+    if (rawBannerUrl) {
+        if (rawBannerUrl.length > 2000) {
+            return res.status(400).json({ error: 'Banner URL is too long.' });
+        }
+        try {
+            bannerUrl = validateBannerMediaUrl(rawBannerUrl);
+        } catch (_) {
+            return res.status(400).json({ error: 'Enter a valid public banner URL.' });
+        }
+    }
+
+    try {
+        const currentResult = await pool.query(`
+            SELECT banner_url, banner_image, banner_image_source_url, requirement,
+                   COALESCE(banner_preview_time, 0) AS banner_preview_time
+            FROM demons
+            WHERE id = $1::integer AND list_type = $2::text
+        `, [demonId, list]);
+
+        if (!currentResult.rows.length) {
+            return res.status(404).json({ error: 'Level not found.' });
+        }
+
+        const current = currentResult.rows[0];
+        let requirement = Number(current.requirement) || 0;
+        if (list === 'primary' && Object.prototype.hasOwnProperty.call(req.body || {}, 'requirement')) {
+            const requestedRequirement = Number(req.body.requirement);
+            if (!Number.isInteger(requestedRequirement) || requestedRequirement < 1 || requestedRequirement > 100) {
+                return res.status(400).json({ error: 'Minimum list percentage must be a whole number from 1 to 100.' });
+            }
+            requirement = requestedRequirement;
+        }
+
+        let previewTime = 0;
+        if (bannerUrl) {
+            const requestedPreviewTime = Object.prototype.hasOwnProperty.call(req.body || {}, 'previewTime')
+                ? Number(req.body.previewTime)
+                : Number(current.banner_preview_time || 0);
+            if (!Number.isFinite(requestedPreviewTime) || requestedPreviewTime < 0 || requestedPreviewTime > 86400) {
+                return res.status(400).json({ error: 'Banner preview frame must be a valid video timestamp.' });
+            }
+            previewTime = Math.round(requestedPreviewTime * 100) / 100;
+        }
+
+        let bannerImage = null;
+        let refreshedBannerImage = false;
+        if (bannerUrl) {
+            const canReuseExistingPreview = Boolean(
+                current.banner_image &&
+                current.banner_url === bannerUrl &&
+                current.banner_image_source_url === bannerUrl &&
+                Math.abs((Number(current.banner_preview_time) || 0) - previewTime) < 0.005 &&
+                !hasPngSignature(current.banner_image)
+            );
+
+            if (canReuseExistingPreview) {
+                bannerImage = current.banner_image;
+            } else {
+                try {
+                    bannerImage = await captureBannerPreview(bannerUrl, previewTime);
+                    refreshedBannerImage = true;
+                } catch (previewErr) {
+                    console.error('Banner preview capture error:', previewErr);
+                    return res.status(400).json({ error: 'Could not capture that frame from the banner video. Make sure the selected frame is inside a direct MP4 or WebM video.' });
+                }
+            }
+        }
+
+        const result = await pool.query(`
+            UPDATE demons
+            SET banner_url = $1::text,
+                banner_image = $2::bytea,
+                banner_image_source_url = $1::text,
+                banner_image_updated_at = CASE
+                    WHEN $1::text IS NULL THEN NULL::timestamptz
+                    WHEN $5::boolean THEN NOW()
+                    ELSE banner_image_updated_at
+                END,
+                requirement = $6::integer,
+                banner_preview_time = $7::double precision
+            WHERE id = $3::integer AND list_type = $4::text
+            RETURNING banner_url, banner_image_updated_at, requirement,
+                      COALESCE(banner_preview_time, 0) AS banner_preview_time
+        `, [bannerUrl, bannerImage, demonId, list, refreshedBannerImage, requirement, previewTime]);
+
+        return res.json({
+            message: bannerUrl ? 'Level settings updated.' : 'Level settings updated; banner removed.',
+            banner_url: result.rows[0].banner_url || null,
+            has_banner_image: Boolean(bannerImage),
+            banner_image_updated_at: result.rows[0].banner_image_updated_at || null,
+            banner_preview_time: Number(result.rows[0].banner_preview_time) || 0,
+            requirement: Number(result.rows[0].requirement) || 0,
+        });
+    } catch (err) {
+        console.error('Banner update error:', err);
+        return res.status(500).json({ error: 'Could not update level settings.' });
+    }
+});
+
+app.get('/api/demons/:id/banner-image', async (req, res) => {
+    const demonId = Number.parseInt(req.params.id, 10);
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    if (!Number.isInteger(demonId)) return res.status(400).end();
+
+    try {
+        const image = await ensureBannerPreviewImage(demonId, list);
+        if (!image) return res.status(404).end();
+        res.set('Content-Type', 'image/jpeg');
+        res.set('Cache-Control', 'public, max-age=86400, stale-while-revalidate=604800');
+        return res.send(image);
+    } catch (err) {
+        console.error('Banner image load error:', err);
+        return res.status(404).end();
+    }
+});
+
+app.post('/api/admin/move-demon', isAdmin, async (req, res) => {
+    const { id, oldPosition, newPosition } = req.body;
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const actorId = req.session.userId;
+
+    const oldPos = parseInt(oldPosition);
+    const newPos = parseInt(newPosition);
+
+    if (!id || !oldPos || !newPos) {
+        return res.status(400).json({ error: "Missing data" });
+    }
+    if (oldPos === newPos) {
+        return res.status(400).json({ error: "Old position and new position are the same." });
+    }
+
+    const client = await pool.connect();
+    
+    try {
+        const userRes = await client.query('SELECT role FROM users WHERE id = $1', [actorId]);
+        const userRole = userRes.rows[0]?.role;
+
+        if (oldPos > 150 || newPos > 150) {
+            client.release();
+            return res.status(403).json({ error: "Legacy List" });
+        }
+
+        await client.query('BEGIN');
+
+        const boundaries = await client.query(
+            `SELECT position, name FROM demons WHERE list_type = $1 AND position IN (75, 76, 150, 151)`,
+            [list]
+        );
+        const old75 = boundaries.rows.find(r => r.position === 75)?.name;
+        const old76 = boundaries.rows.find(r => r.position === 76)?.name;
+        const old150 = boundaries.rows.find(r => r.position === 150)?.name;
+        const old151 = boundaries.rows.find(r => r.position === 151)?.name;
+
+        const levelRes = await client.query('SELECT name, list_type FROM demons WHERE id = $1', [id]);
+        if (levelRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(404).json({ error: "Level not found" });
+        }
+
+        const { name: levelName, list_type } = levelRes.rows[0];
+
+        if (list_type !== list) {
+            await client.query('ROLLBACK');
+            client.release();
+            return res.status(400).json({ error: "This level does not belong to the active list layout." });
+        }
+
+        if (newPos < oldPos) {
+            await client.query(
+                'UPDATE demons SET position = position + 1 WHERE list_type = $3 AND position >= $1 AND position < $2',
+                [newPos, oldPos, list]
+            );
+        } else {
+            await client.query(
+                'UPDATE demons SET position = position - 1 WHERE list_type = $3 AND position > $1 AND position <= $2',
+                [oldPos, newPos, list]
+            );
+        }
+
+        await client.query('UPDATE demons SET position = $1 WHERE id = $2', [newPos, id]);
+        
+        await client.query(
+            `INSERT INTO changelog (demon_id, demon_name, change_type, old_position, new_position, list_type) 
+             VALUES ($1, $2, 'moved', $3, $4, $5)`,
+            [id, levelName, oldPos, newPos, list]
+        );
+
+        const neighborsRes = await client.query(
+            `SELECT name, position FROM demons WHERE list_type = $1 AND position IN ($2, $3)`,
+            [list, newPos - 1, newPos + 1]
+        );
+
+        await client.query('COMMIT');
+
+        const above = neighborsRes.rows.find(r => r.position == newPos - 1)?.name;
+        const below = neighborsRes.rows.find(r => r.position == newPos + 1)?.name;
+        
+        const action = newPos < oldPos ? "raised" : "lowered";
+        let msg = `**${levelName}** has been **${action}** to **#${newPos}**`;
+        
+        let context = [];
+        if (below) context.push(`above **${below}**`);
+        if (above) context.push(`below **${above}**`);
+
+        if (context.length > 0) msg += ", " + context.join(" and ");
+        msg += ".";
+
+        if (list === 'primary') {
+            let pushes = [];
+            if (newPos < oldPos) { 
+                if (newPos <= 75 && oldPos > 75 && old75) pushes.push(`**${old75}** into the Extended List`);
+                if (newPos <= 150 && oldPos > 150 && old150) pushes.push(`**${old150}** into the Legacy List`);
+            } else if (newPos > oldPos) { 
+                if (oldPos <= 75 && newPos >= 76 && old76) pushes.push(`**${old76}** back to the Main List`);
+                if (oldPos <= 150 && newPos >= 151 && old151) pushes.push(`**${old151}** back to the Extended List`);
+            }
+
+            if (pushes.length > 0) {
+                msg += ` This change pushes ${pushes.join(" and ")}.`;
+            }
+        }
+
+        sendDiscordNotification(msg, list);
+
+        const leaderboardSync = await syncLeaderboardTopOne(list);
+        for (const changedUserId of leaderboardSync.changedUserIds || []) {
+            await evaluateUserBadges(changedUserId, list);
+        }
+
+        res.json({ message: "Level moved successfully" });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error(err);
+        res.status(500).json({ error: "Database error during move execution." });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/verifications/pending', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    try {
+        const result = await pool.query(`
+            SELECT id, level_name, level_author, level_id, video_url, raw_footage_url,
+                   placement_opinion, enjoyment_rating, submission_comments
+            FROM verifications
+            WHERE user_id = $1 AND status = 'pending' AND list_type = $2
+            ORDER BY id DESC
+        `, [req.session.userId, list]);
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Pending verification fetch error:', err);
+        res.status(500).json({ error: 'Could not load pending verifications.' });
+    }
+});
+
+app.patch('/api/verifications/pending/:verifId', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const verifId = Number.parseInt(req.params.verifId, 10);
+    const name = cleanProfileText(req.body.name, 20);
+    const author = cleanProfileText(req.body.author, 100);
+    const levelId = String(req.body.levelId ?? '').trim();
+    const opinion = Number.parseInt(req.body.opinion, 10);
+    const normalizedVideo = normalizeVideoSubmission(req.body.videoUrl);
+    const rawFootageUrl = String(req.body.rawFootageUrl || '').trim();
+    const normalizedRawFootage = rawFootageUrl ? normalizeVideoSubmission(rawFootageUrl) : null;
+    const enjoymentRating = list === 'impossible' ? null : normalizeEnjoymentRating(req.body.enjoymentRating, 100);
+    const comments = cleanProfileText(req.body.comments, 1000);
+    if (String(req.body.comments ?? '').trim().length > 1000) {
+        return res.status(400).json({ error: "Comments are limited to 1000 characters." });
+    }
+
+    if (!Number.isInteger(verifId)) return res.status(400).json({ error: 'Invalid verification.' });
+    if (!name || !author || !levelId) return res.status(400).json({ error: 'Level name, creator, and ID are required.' });
+    if (!Number.isInteger(opinion) || opinion < 1 || opinion > 150) return res.status(400).json({ error: 'Placement must be between 1 and 150.' });
+    if (!normalizedVideo) return res.status(400).json({ error: 'Verification video link is not from an allowed domain.' });
+    if (rawFootageUrl && !normalizedRawFootage) return res.status(400).json({ error: 'Raw footage link is not from an allowed domain.' });
+    if (list !== 'impossible' && req.body.enjoymentRating !== '' && req.body.enjoymentRating != null && enjoymentRating === null) {
+        return res.status(400).json({ error: 'Enjoyment rating must be between 1 and 10.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const restriction = await getSubmissionRestriction(client, req.session.userId);
+        if (restriction) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: restriction });
+        }
+
+        const existing = await client.query(`
+            SELECT id
+            FROM verifications
+            WHERE id = $1 AND user_id = $2 AND status = 'pending' AND list_type = $3
+            FOR UPDATE
+        `, [verifId, req.session.userId, list]);
+        if (!existing.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Pending verification not found.' });
+        }
+
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [normalizedVideo.key]);
+        const canReuseOwnVideo = await canReuseOwnSubmissionVideo(client, req.session.userId);
+        const reuse = await findActiveVideoReuse(client, normalizedVideo.key, {
+            excludeVerificationId: verifId,
+            allowOwnUserId: canReuseOwnVideo ? req.session.userId : null,
+        });
+        if (reuse) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'That video has already been used.' });
+        }
+
+        await client.query(`
+            UPDATE verifications
+            SET level_name = $1,
+                level_author = $2,
+                level_id = $3,
+                video_url = $4,
+                raw_footage_url = $5,
+                placement_opinion = $6,
+                enjoyment_rating = $7,
+                submission_comments = $8
+            WHERE id = $9
+        `, [name, author, levelId, normalizedVideo.cleanUrl, normalizedRawFootage?.cleanUrl || null, opinion, enjoymentRating, comments || null, verifId]);
+        await client.query('COMMIT');
+        return res.json({ message: 'Pending verification updated.' });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Pending verification update error:', err);
+        return res.status(500).json({ error: 'Could not update pending verification.' });
+    } finally {
+        client.release();
+    }
+});
+
+
+app.delete('/api/verifications/pending/:verifId', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const verifId = Number.parseInt(req.params.verifId, 10);
+    if (!Number.isInteger(verifId)) return res.status(400).json({ error: 'Invalid verification.' });
+
+    try {
+        const result = await pool.query(`
+            DELETE FROM verifications
+            WHERE id = $1 AND user_id = $2 AND status = 'pending' AND list_type = $3
+            RETURNING id
+        `, [verifId, req.session.userId, list]);
+        if (!result.rows.length) return res.status(404).json({ error: 'Pending verification not found.' });
+        res.json({ message: 'Pending verification cancelled.' });
+    } catch (err) {
+        console.error('Pending verification delete error:', err);
+        res.status(500).json({ error: 'Could not cancel pending verification.' });
+    }
+});
+
+app.get('/api/admin/pending-verifications', isAdmin, async (req, res) => {
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    try {
+        const result = await pool.query(`
+            SELECT v.*, u.username 
+            FROM verifications v
+            JOIN users u ON v.user_id = u.id
+            WHERE v.status = 'pending' AND v.list_type = $1
+            ORDER BY v.id ASC
+        `, [list]);
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to fetch verifications" });
+    }
+});
+
+app.post('/api/admin/reject-verification', isAdmin, async (req, res) => {
+    const { verifId, reason } = req.body;
+    const actorId = req.session.userId;
+    const activeSubdomainList = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+        const actorQuery = await client.query('SELECT role FROM users WHERE id = $1', [actorId]);
+        const actorRole = actorQuery.rows[0]?.role;
+
+        const verifQuery = await client.query(
+            'SELECT user_id, level_name, list_type, status FROM verifications WHERE id = $1 FOR UPDATE',
+            [verifId]
+        );
+        if (!verifQuery.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "Verification not found" });
+        }
+
+        const { user_id, level_name, list_type, status: verificationStatus } = verifQuery.rows[0];
+        if (verificationStatus !== 'pending') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'This verification has already been reviewed.' });
+        }
+        if (list_type !== activeSubdomainList) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "This request does not belong to the active list." });
+        }
+
+        if (!canReviewSubmission(actorId, user_id, actorRole)) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: "You cannot review your own verification." });
+        }
+
+        await client.query(
+            "UPDATE verifications SET status = $1, rejection_reason = $2 WHERE id = $3 AND status = 'pending'",
+            ['rejected', reason || null, verifId]
+        );
+
+        await logModerationAction(client, {
+            moderatorId: actorId,
+            submissionType: 'verification',
+            decision: 'rejected',
+            listType: list_type,
+            submissionId: Number(verifId),
+            submitterId: user_id,
+        });
+
+        await createInboxNotification(client, {
+            userId: user_id,
+            actorId,
+            type: 'verif_rejected',
+            reason: reason || null,
+            listType: list_type,
+            subject: `Verification rejected: ${level_name}`,
+            body: `Your verification submission for **${level_name}** was rejected.${reason ? `\n\n**Reason:** ${reason}` : ''}`,
+        });
+
+        await client.query('COMMIT');
+        res.json({ message: "Verification rejected." });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Rejection error:', err);
+        res.status(500).json({ error: "Failed to reject verification: " + err.message });
+    } finally {
+        client.release();
+    }
+});
+
+app.post('/api/admin/approve-verification', isAdmin, async (req, res) => {
+    const { verifId, demonId } = req.body;
+    const actorId = req.session.userId;
+    const activeSubdomainList = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    const client = await pool.connect();
+    let userId = null;
+    let listType = activeSubdomainList;
+
+    try {
+        await client.query('BEGIN');
+        const actorQuery = await client.query('SELECT role FROM users WHERE id = $1', [actorId]);
+        const actorRole = actorQuery.rows[0]?.role;
+
+        const verifQuery = await client.query(
+            'SELECT user_id, video_url, list_type, level_name, enjoyment_rating, placement_opinion, submission_comments, status FROM verifications WHERE id = $1 FOR UPDATE',
+            [verifId]
+        );
+        if (!verifQuery.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "Verification data missing" });
+        }
+
+        const verification = verifQuery.rows[0];
+        userId = verification.user_id;
+        listType = verification.list_type;
+
+        if (verification.status !== 'pending') {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'This verification has already been reviewed.' });
+        }
+
+        if (verification.list_type !== activeSubdomainList) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "This request does not belong to the active list." });
+        }
+
+        if (!canReviewSubmission(actorId, verification.user_id, actorRole)) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: "You cannot review your own verification." });
+        }
+
+        await client.query("UPDATE verifications SET status = $1 WHERE id = $2 AND status = 'pending'", ['accepted', verifId]);
+
+        let recordId = null;
+        if (verification.list_type === 'impossible') {
+            await client.query('UPDATE demons SET showcase_url = $1 WHERE id = $2', [verification.video_url, demonId]);
+        } else {
+            const demonResult = await client.query('SELECT position, name FROM demons WHERE id = $1', [demonId]);
+            const demon = demonResult.rows[0];
+            if (!demon) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({ error: "Level not found." });
+            }
+
+            const newRecord = await client.query(`
+                INSERT INTO records
+                    (user_id, demon_id, percentage, video_url, status, list_type, accepted_position, enjoyment_rating, personal_placement, verification_id, submission_comments)
+                VALUES ($1, $2, 100, $3, 'accepted', $4, $5, $6, $7, $8, $9)
+                RETURNING id
+            `, [
+                verification.user_id,
+                demonId,
+                verification.video_url,
+                verification.list_type,
+                demon.position,
+                verification.enjoyment_rating,
+                verification.placement_opinion,
+                verifId,
+                verification.submission_comments || null,
+            ]);
+            recordId = newRecord.rows[0].id;
+        }
+
+        await logModerationAction(client, {
+            moderatorId: actorId,
+            submissionType: 'verification',
+            decision: 'accepted',
+            listType: verification.list_type,
+            submissionId: Number(verifId),
+            submitterId: verification.user_id,
+        });
+
+        await createInboxNotification(client, {
+            userId: verification.user_id,
+            actorId,
+            recordId,
+            type: 'verif_accepted',
+            listType: verification.list_type,
+            subject: `Verification accepted: ${verification.level_name}`,
+            body: `Your verification for **${verification.level_name}** was accepted and added to the list.`,
+        });
+
+        await client.query('COMMIT');
+
+        const sync = await syncLeaderboardTopOne(listType);
+        for (const affectedId of new Set([Number(userId), ...(sync.changedUserIds || []).map(Number)])) {
+            if (affectedId) await evaluateUserBadges(affectedId, listType);
+        }
+
+        res.json({ message: "Level verified and record added to list." });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error(err);
+        res.status(500).json({ error: "Failed to finalize verification" });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/admin/moderator-leaderboard', isAdmin, async (req, res) => {
+    const range = String(req.query.range || 'all').toLowerCase();
+    const validRanges = new Set(['today', 'week', 'month', 'all']);
+    if (!validRanges.has(range)) {
+        return res.status(400).json({ error: 'Invalid leaderboard range.' });
+    }
+
+    const submissionType = String(req.query.submissionType || 'record').toLowerCase();
+    if (!['record', 'verification'].includes(submissionType)) {
+        return res.status(400).json({ error: 'Invalid submission type.' });
+    }
+
+    let since = null;
+    if (range !== 'all') {
+        const parsed = new Date(String(req.query.since || ''));
+        if (Number.isNaN(parsed.getTime())) {
+            return res.status(400).json({ error: 'Invalid leaderboard start date.' });
+        }
+        since = parsed.toISOString();
+    }
+
+    try {
+        const allowedRoles = submissionType === 'verification'
+            ? ['admin', 'owner']
+            : ['moderator', 'admin', 'owner'];
+
+        const result = await pool.query(`
+            SELECT
+                u.id,
+                u.username,
+                LOWER(COALESCE(u.role, '')) AS role,
+                u.icon_type,
+                u.icon_id,
+                u.color1,
+                u.color2,
+                u.glow,
+                COALESCE(stats.accepted, 0)::integer AS accepted,
+                COALESCE(stats.rejected, 0)::integer AS rejected,
+                (COALESCE(stats.accepted, 0) + COALESCE(stats.rejected, 0))::integer AS total
+            FROM users u
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE action->>'decision' = 'accepted') AS accepted,
+                    COUNT(*) FILTER (WHERE action->>'decision' = 'rejected') AS rejected
+                FROM jsonb_array_elements(COALESCE(u.moderation_actions, '[]'::jsonb)) AS action
+                WHERE ($1::timestamptz IS NULL OR (action->>'at')::timestamptz >= $1::timestamptz)
+                  AND action->>'type' = $2::text
+                  AND (
+                    CASE
+                        WHEN NULLIF(action->>'submitterId', '') IS NOT NULL THEN EXISTS (
+                            SELECT 1
+                            FROM users submitter
+                            WHERE submitter.id = NULLIF(action->>'submitterId', '')::integer
+                              AND COALESCE(submitter.account_disabled, FALSE) = FALSE
+                        )
+                        WHEN NULLIF(action->>'submissionId', '') IS NOT NULL
+                             AND $2::text = 'record' THEN EXISTS (
+                            SELECT 1
+                            FROM records source_record
+                            JOIN users submitter ON submitter.id = source_record.user_id
+                            WHERE source_record.id = NULLIF(action->>'submissionId', '')::integer
+                              AND COALESCE(submitter.account_disabled, FALSE) = FALSE
+                        )
+                        WHEN NULLIF(action->>'submissionId', '') IS NOT NULL
+                             AND $2::text = 'verification' THEN EXISTS (
+                            SELECT 1
+                            FROM verifications source_verification
+                            JOIN users submitter ON submitter.id = source_verification.user_id
+                            WHERE source_verification.id = NULLIF(action->>'submissionId', '')::integer
+                              AND COALESCE(submitter.account_disabled, FALSE) = FALSE
+                        )
+                        ELSE TRUE
+                    END
+                  )
+            ) stats ON TRUE
+            WHERE LOWER(COALESCE(u.role, '')) = ANY($3::text[])
+            ORDER BY total DESC, accepted DESC, LOWER(u.username) ASC
+        `, [since, submissionType, allowedRoles]);
+
+        res.json({
+            range,
+            submissionType,
+            staff: result.rows.map(row => ({
+                ...row,
+                icon: {
+                    type: row.icon_type || 'cube',
+                    id: readProfileInt(row.icon_id, 1),
+                    color1: readProfileInt(row.color1, 12),
+                    color2: readProfileInt(row.color2, 3),
+                    glow: readProfileInt(row.glow, -1),
+                },
+            })),
+        });
+    } catch (err) {
+        console.error('Staff leaderboard error:', err);
+        res.status(500).json({ error: 'Could not load staff leaderboard.' });
+    }
+});
+
+
+app.get('/moderators', isMod, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'moderators.html'));
+});
+
+app.get('/admin', isAdmin, (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+});
+
+app.get('/api/profile/:username', async (req, res) => {
+    const { username } = req.params;
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    try {
+        const userResult = await pool.query(
+            `SELECT id, username, created_at, role,
+                    display_name, bio, pronouns, country,
+                    social_youtube, social_twitter, social_twitch, social_discord, social_reddit, social_gdbrowser, discord_username,
+                    icon_type, icon_id, color1, color2, glow,
+                    leaderboard_banned, leaderboard_ban_reason,
+                    account_disabled, account_disabled_reason
+             FROM users WHERE LOWER(username) = LOWER($1)`,
+            [username]
+        );
+
+        if (!userResult.rows.length) return res.status(404).json({ error: "User not found" });
+        const user = userResult.rows[0];
+
+        const recordsResult = await pool.query(`
+            SELECT
+                r.id AS record_id,
+                r.percentage,
+                r.video_url,
+                r.enjoyment_rating,
+                r.accepted_position,
+                d.name,
+                d.position,
+                d.requirement,
+                d.id AS demon_id,
+                (
+                    SELECT COUNT(*)
+                    FROM records r2
+                    JOIN users u2 ON u2.id = r2.user_id
+                    WHERE r2.demon_id = r.demon_id
+                      AND r2.status = 'accepted'
+                      AND r2.percentage = 100
+                      AND r2.list_type = $2
+                      AND r2.id < r.id
+                      AND COALESCE(u2.leaderboard_banned, FALSE) = FALSE
+                ) AS completion_status
+            FROM records r
+            JOIN demons d ON r.demon_id = d.id
+            WHERE r.user_id = $1
+              AND r.status = 'accepted'
+              AND r.list_type = $2
+              AND d.list_type = $2
+            ORDER BY d.position ASC
+        `, [user.id, list]);
+
+        const recordsWithPoints = recordsResult.rows.map(r => {
+            const basePoints = 250 * Math.exp(-0.0263 * (r.position - 1));
+            let awardedPoints = 0;
+
+            if (r.position > 150) {
+                awardedPoints = 0;
+            } else if (list === 'impossible') {
+                awardedPoints = basePoints * (r.percentage / 100);
+            } else if (r.percentage === 100) {
+                awardedPoints = basePoints;
+            } else if (r.position <= 75 && r.percentage >= r.requirement) {
+                awardedPoints = basePoints / 10;
+            }
+
+            return {
+                ...r,
+                points: awardedPoints.toFixed(2),
+                record_id: r.record_id,
+                enjoyment_rating: r.enjoyment_rating == null ? null : Number(r.enjoyment_rating),
+            };
+        });
+
+        const totalPoints = recordsWithPoints.reduce((sum, r) => sum + parseFloat(r.points), 0).toFixed(2);
+
+        const sync = await syncLeaderboardTopOne(list);
+        for (const changedUserId of sync.changedUserIds || []) {
+            if (Number(changedUserId) !== Number(user.id)) {
+                await evaluateUserBadges(changedUserId, list);
+            }
+        }
+
+        const rankResult = await pool.query(`
+            WITH Leaderboard AS (
+                SELECT
+                    u.id,
+                    SUM(
+                        CASE
+                            WHEN d.position > 150 THEN 0
+                            WHEN $2 = 'impossible' THEN
+                                (250 * EXP(-0.0263 * (d.position - 1))) * (r.percentage / 100.0)
+                            ELSE
+                                CASE
+                                    WHEN r.percentage = 100 THEN (250 * EXP(-0.0263 * (d.position - 1)))
+                                    WHEN d.position <= 75 AND r.percentage >= d.requirement THEN
+                                        (250 * EXP(-0.0263 * (d.position - 1))) / 10
+                                    ELSE 0
+                                END
+                        END
+                    ) AS total_score
+                FROM users u
+                JOIN records r ON u.id = r.user_id
+                JOIN demons d ON r.demon_id = d.id
+                WHERE r.status = 'accepted'
+                  AND r.list_type = $2
+                  AND d.list_type = $2
+                  AND COALESCE(u.leaderboard_banned, FALSE) = FALSE
+                GROUP BY u.id
+            ),
+            RankedPlayers AS (
+                SELECT id, total_score, RANK() OVER (ORDER BY total_score DESC) AS rank
+                FROM Leaderboard
+                WHERE total_score > 0
+            )
+            SELECT rank FROM RankedPlayers WHERE id = $1
+        `, [user.id, list]);
+
+        const leaderboardRank = rankResult.rows.length ? Number(rankResult.rows[0].rank) : 0;
+        const badges = list === 'primary'
+            ? await evaluateUserBadges(user.id, list)
+            : [];
+
+        let moderation = null;
+        let badgeCatalog = null;
+        if (req.session?.userId) {
+            const viewerResult = await pool.query('SELECT id, role FROM users WHERE id = $1', [req.session.userId]);
+            const viewer = viewerResult.rows[0];
+            if (viewer && isStaffRole(viewer.role)) {
+                moderation = {
+                    viewerId: viewer.id,
+                    viewerRole: viewer.role,
+                    canModerate: Number(viewer.id) !== Number(user.id)
+                        && canModerateTargetRole(viewer.role, user.role),
+                    leaderboardBanned: Boolean(user.leaderboard_banned),
+                    leaderboardBanReason: user.leaderboard_ban_reason || '',
+                    accountDisabled: Boolean(user.account_disabled),
+                    accountDisabledReason: user.account_disabled_reason || '',
+                    targetProtectedFromBans: isStaffRole(user.role),
+                };
+            }
+            if (viewer?.role === 'owner' && list === 'primary') {
+                badgeCatalog = loadBadgeConfig().groups
+                    .map(group => ({
+                        id: String(group.id || ''),
+                        scope: group.scope === 'global' ? 'global' : 'list',
+                        iconPath: group.iconPath || '/assets/icon.png',
+                        tiers: (Array.isArray(group.tiers) ? group.tiers : [])
+                            .map(tier => ({
+                                id: Number(tier.id),
+                                name: String(tier.name || ''),
+                                description: String(tier.description || ''),
+                                iconPath: tier.iconPath || group.iconPath || '/assets/icon.png',
+                            }))
+                            .filter(tier => Number.isInteger(tier.id)),
+                    }))
+                    .filter(group => group.id);
+            }
+        }
+
+        const clanTags = await getClanTagsForUsers(pool, [user.id]);
+        const serializedProfile = serializeProfileUser(user);
+        serializedProfile.displayName = formatClanDisplayName(
+            user.display_name || user.username,
+            clanTags.get(Number(user.id))
+        );
+
+        res.json({
+            username: user.username,
+            joined: user.created_at,
+            totalPoints,
+            leaderboardRank,
+            records: recordsWithPoints,
+            role: user.role,
+            userId: user.id,
+            badges,
+            badgeCatalog,
+            moderation,
+            leaderboardBanned: Boolean(user.leaderboard_banned),
+            accountDisabled: Boolean(user.account_disabled),
+            ...serializedProfile,
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Database error" });
+    }
+});
+
+app.get('/api/leaderboard/search', async (req, res) => {
+    const rawQuery = String(req.query.q || '').trim().slice(0, 64);
+    if (!rawQuery) return res.json([]);
+
+    const numericId = /^\d+$/.test(rawQuery) && Number(rawQuery) <= 2147483647
+        ? Number(rawQuery)
+        : null;
+    const likeQuery = `%${rawQuery}%`;
+
+    try {
+        const result = await pool.query(`
+            SELECT
+                u.id AS user_id,
+                u.username,
+                u.display_name,
+                u.role,
+                u.icon_type,
+                u.icon_id,
+                u.color1,
+                u.color2,
+                u.glow
+            FROM users u
+            WHERE COALESCE(u.leaderboard_banned, FALSE) = FALSE
+              AND (
+                    u.username ILIKE $1
+                    OR COALESCE(u.display_name, '') ILIKE $1
+                    OR ($2::integer IS NOT NULL AND u.id = $2)
+              )
+            ORDER BY
+                CASE WHEN $2::integer IS NOT NULL AND u.id = $2 THEN 0 ELSE 1 END,
+                CASE WHEN LOWER(u.username) = LOWER($3) THEN 0 ELSE 1 END,
+                u.username ASC
+            LIMIT 8
+        `, [likeQuery, numericId, rawQuery]);
+
+        const clanTags = await getClanTagsForUsers(pool, result.rows.map(row => row.user_id));
+        const players = result.rows.map(row => ({
+            user_id: Number(row.user_id),
+            username: row.username,
+            displayName: formatClanDisplayName(
+                row.display_name || row.username,
+                clanTags.get(Number(row.user_id))
+            ),
+            role: row.role || '',
+            icon: {
+                type: row.icon_type || 'cube',
+                id: readProfileInt(row.icon_id, 1),
+                color1: readProfileInt(row.color1, 12),
+                color2: readProfileInt(row.color2, 3),
+                glow: readProfileInt(row.glow, -1),
+            }
+        }));
+
+        res.json(players);
+    } catch (err) {
+        console.error('Leaderboard player search error:', err);
+        res.status(500).json({ error: 'Could not search players.' });
+    }
+});
+
+app.get('/api/leaderboard', async (req, res) => {
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    try {
+        const sync = await syncLeaderboardTopOne(list);
+        for (const changedUserId of sync.changedUserIds || []) {
+            await evaluateUserBadges(changedUserId, list);
+        }
+
+        const query = `
+            WITH PlayerStats AS (
+                SELECT 
+                    u.id AS user_id,
+                    u.username,
+                    u.display_name,
+                    u.role,
+                    u.icon_type,
+                    u.icon_id,
+                    u.color1,
+                    u.color2,
+                    u.glow,
+                    SUM(
+                        CASE 
+                            WHEN d.position > 150 THEN 0
+                            
+                            WHEN $1 = 'impossible' 
+                                THEN (250 * EXP(-0.0263 * (d.position - 1))) * (r.percentage / 100.0)
+                            ELSE
+                                CASE 
+                                    WHEN r.percentage = 100 
+                                        THEN (250 * EXP(-0.0263 * (d.position - 1)))
+                                    WHEN d.position <= 75 AND r.percentage >= d.requirement 
+                                        THEN (250 * EXP(-0.0263 * (d.position - 1))) / 10
+                                    ELSE 0 
+                                END
+                        END
+                    ) as total_points,
+                    
+                    CASE 
+                        WHEN $1 = 'impossible' 
+                            THEN COUNT(r.id) FILTER (WHERE r.percentage = 100)
+                        ELSE 
+                            COUNT(r.id) FILTER (WHERE r.percentage = 100 AND d.position <= 75)
+                    END as main_completions,
+                    
+                    CASE 
+                        WHEN $1 = 'impossible' 
+                            THEN 0
+                        ELSE 
+                            COUNT(r.id) FILTER (WHERE r.percentage = 100 AND d.position > 75 AND d.position <= 150)
+                    END as extended_completions,
+
+                    CASE
+                        WHEN $1 = 'impossible'
+                            THEN 0
+                        ELSE
+                            COUNT(r.id) FILTER (WHERE r.percentage = 100 AND d.position > 150)
+                    END as legacy_completions,
+                    
+                    CASE 
+                        WHEN $1 = 'impossible' 
+                            THEN COUNT(r.id) FILTER (WHERE r.percentage < 100)
+                        ELSE 
+                            COUNT(r.id) FILTER (WHERE r.percentage < 100)
+                    END as progress_records
+                FROM users u
+                JOIN records r ON u.id = r.user_id
+                JOIN demons d ON r.demon_id = d.id
+                WHERE r.status = 'accepted'
+                  AND r.list_type = $1
+                  AND d.list_type = $1
+                  AND COALESCE(u.leaderboard_banned, FALSE) = FALSE
+                GROUP BY u.id, u.username, u.display_name, u.role, u.icon_type, u.icon_id, u.color1, u.color2, u.glow
+                HAVING SUM(
+                    CASE 
+                        WHEN d.position > 150 THEN 0
+                        
+                        WHEN $1 = 'impossible' 
+                            THEN (250 * EXP(-0.0263 * (d.position - 1))) * (r.percentage / 100.0)
+                        ELSE
+                            CASE 
+                                WHEN r.percentage = 100 
+                                    THEN (250 * EXP(-0.0263 * (d.position - 1)))
+                                WHEN d.position <= 75 AND r.percentage >= d.requirement 
+                                    THEN (250 * EXP(-0.0263 * (d.position - 1))) / 10
+                                ELSE 0 
+                            END
+                    END
+                ) > 0
+            ),
+            RankedPlayers AS (
+                SELECT 
+                    *,
+                    RANK() OVER (ORDER BY total_points DESC) as leaderboard_rank
+                FROM PlayerStats
+            )
+            SELECT * FROM RankedPlayers 
+            WHERE leaderboard_rank <= 100
+            ORDER BY total_points DESC;
+        `;
+        
+        const result = await pool.query(query, [list]);
+        
+        const clanTags = await getClanTagsForUsers(pool, result.rows.map(row => row.user_id));
+        const leaderboard = result.rows.map(row => ({
+            ...row,
+            displayName: formatClanDisplayName(
+                row.display_name || row.username,
+                clanTags.get(Number(row.user_id))
+            ),
+            role: row.role || '',
+            icon: {
+                type: row.icon_type || 'cube',
+                id: readProfileInt(row.icon_id, 1),
+                color1: readProfileInt(row.color1, 12),
+                color2: readProfileInt(row.color2, 3),
+                glow: readProfileInt(row.glow, -1),
+            },
+            total_points: parseFloat(row.total_points || 0).toFixed(2),
+            rank: parseInt(row.leaderboard_rank)
+        }));
+
+        res.json(leaderboard);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Could not fetch leaderboard" });
+    }
+});
+
+app.get('/api/demons/:id', async (req, res) => {
+    const demonId = req.params.id;
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    
+    try {
+        const demonResult = await pool.query(`
+            SELECT id, name, author, position, level_id, requirement, list_type, showcase_url,
+                   banner_url, banner_image_updated_at, COALESCE(banner_preview_time, 0) AS banner_preview_time,
+                   (banner_image IS NOT NULL AND octet_length(banner_image) > 0) AS has_banner_image
+            FROM demons
+            WHERE id = $1
+        `, [demonId]);
+        
+        if (demonResult.rows.length === 0) {
+            return res.status(404).json({ error: "Demon not found" });
+        }
+
+        const demon = demonResult.rows[0];
+
+        if (demon.list_type !== list) {
+            return res.status(400).json({ error: "This level does not belong to the active list." });
+        }
+
+        const timeMachineDate = parseTimeMachineDate(req.query.date || req.query.time_machine_date);
+
+        if (timeMachineDate) {
+            const minDateValue = await getTimeMachineMinDateValue(list);
+
+            if (isTimeMachineDateAllowed(timeMachineDate, minDateValue)) {
+                const currentRows = await queryCurrentDemonSnapshotRows(list);
+                const historicalRows = await buildHistoricalDemonSnapshot(currentRows, list, timeMachineDate);
+                const historicalDemon = historicalRows.find(row => Number(row.id) === Number(demonId));
+
+                if (!historicalDemon) {
+                    return res.status(404).json({ error: "This level did not exist on that date." });
+                }
+
+                demon.position = historicalDemon.position;
+                demon.time_machine_snapshot = true;
+                demon.time_machine_date = req.query.date || req.query.time_machine_date;
+            }
+        }
+
+        const recordsResult = await pool.query(`
+            SELECT records.*,
+                   users.id AS user_id,
+                   users.username,
+                   users.display_name,
+                   users.role,
+                   users.icon_type,
+                   users.icon_id,
+                   users.color1,
+                   users.color2,
+                   users.glow
+            FROM records 
+            JOIN users ON records.user_id = users.id 
+            WHERE records.demon_id = $1
+              AND records.status = 'accepted'
+              AND records.list_type = $2
+              AND COALESCE(users.leaderboard_banned, FALSE) = FALSE
+            ORDER BY records.percentage DESC, records.id ASC
+        `, [demonId, list]);
+
+        let showcase_link = null;
+
+        if (list === 'impossible') {
+            showcase_link = demon.showcase_url;
+        } else {
+            const firstVictorResult = await pool.query(`
+                SELECT r.video_url
+                FROM records r
+                JOIN users u ON u.id = r.user_id
+                WHERE r.demon_id = $1
+                  AND r.status = 'accepted'
+                  AND r.list_type = $2
+                  AND r.percentage = 100
+                  AND COALESCE(u.leaderboard_banned, FALSE) = FALSE
+                ORDER BY r.id ASC LIMIT 1
+            `, [demonId, list]);
+
+            showcase_link = firstVictorResult.rows.length > 0 
+                ? firstVictorResult.rows[0].video_url 
+                : null;
+        }
+
+        const recordClanTags = await getClanTagsForUsers(pool, recordsResult.rows.map(row => row.user_id));
+        const formattedRecords = recordsResult.rows.map(row => ({
+            ...row,
+            displayName: formatClanDisplayName(
+                row.display_name || row.username,
+                recordClanTags.get(Number(row.user_id))
+            ),
+            role: row.role || '',
+            icon: {
+                type: row.icon_type || 'cube',
+                id: readProfileInt(row.icon_id, 1),
+                color1: readProfileInt(row.color1, 12),
+                color2: readProfileInt(row.color2, 3),
+                glow: readProfileInt(row.glow, -1),
+            },
+        }));
+
+        const [levelUpdate, uploadDateEstimate] = await Promise.all([
+            Promise.resolve(getLevelUpdateFromId(demon.level_id)),
+            getEstimatedLevelUploadDate(demon.level_id)
+        ]);
+
+        res.json({ 
+            ...demon, 
+            showcase_link,
+            level_update: levelUpdate,
+            upload_date_estimate: uploadDateEstimate,
+            records: formattedRecords 
+        });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Database error" });
+    }
+});
+
+
+
+app.get('/api/settings/2fa', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });
+    try {
+        const result = await pool.query(`
+            SELECT email, two_factor_method, two_factor_enabled_at
+            FROM users WHERE id = $1
+        `, [req.session.userId]);
+        const user = result.rows[0];
+        if (!user) return res.status(404).json({ error: 'User not found.' });
+        const methods = getStoredTwoFactorMethods(user.two_factor_method);
+        const method = methods.length === 2 ? 'both' : (methods[0] || null);
+        res.json({
+            enabled: methods.length > 0,
+            method,
+            methods,
+            emailEnabled: methods.includes('email'),
+            appEnabled: methods.includes('app'),
+            email: maskEmailAddress(user.email),
+            enabledAt: user.two_factor_enabled_at || null,
+        });
+    } catch (err) {
+        console.error('2FA settings status error:', err);
+        res.status(500).json({ error: 'Could not load two-factor settings.' });
+    }
+});
+
+app.post('/api/settings/2fa/email/start', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });
+    const currentPassword = String(req.body.currentPassword || '');
+    if (!currentPassword) return res.status(400).json({ error: 'Enter your current password.' });
+
+    try {
+        const result = await pool.query('SELECT id, username, email, password_hash FROM users WHERE id = $1', [req.session.userId]);
+        const user = result.rows[0];
+        if (!user) return res.status(404).json({ error: 'User not found.' });
+        if (!await bcrypt.compare(currentPassword, user.password_hash)) {
+            return res.status(400).json({ error: 'Current password incorrect.' });
+        }
+        if (!user.email) return res.status(400).json({ error: 'Your account does not have an email address.' });
+
+        const code = generateEmailTwoFactorCode();
+        await sendTwoFactorCodeEmail(user.email, user.username, code, 'setup');
+        req.session.twoFactorSettings = {
+            purpose: 'enable-email',
+            userId: Number(user.id),
+            codeHash: hashTwoFactorCode(code, user.id, 'enable-email'),
+            expiresAt: Date.now() + TWO_FACTOR_CODE_TTL_MS,
+            attempts: 0,
+        };
+        res.json({ message: `A verification code was sent to ${maskEmailAddress(user.email)}.`, method: 'email' });
+    } catch (err) {
+        console.error('2FA email setup error:', err);
+        res.status(500).json({ error: 'Could not send the 2FA setup code.' });
+    }
+});
+
+app.post('/api/settings/2fa/email/confirm', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });
+    const challenge = req.session.twoFactorSettings;
+    if (!challenge || challenge.purpose !== 'enable-email' || Number(challenge.userId) !== Number(req.session.userId) || challenge.expiresAt <= Date.now()) {
+        clearTwoFactorSettingsChallenge(req);
+        return res.status(400).json({ error: 'The setup code expired. Start 2FA setup again.' });
+    }
+    const code = normalizeTwoFactorCode(req.body.code);
+    if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter a valid 6-digit code.' });
+
+    const valid = safeEqualText(hashTwoFactorCode(code, req.session.userId, 'enable-email'), challenge.codeHash);
+    if (!valid) {
+        const attempts = Number(challenge.attempts || 0) + 1;
+        if (attempts >= TWO_FACTOR_MAX_ATTEMPTS) {
+            clearTwoFactorSettingsChallenge(req);
+            return res.status(400).json({ error: 'Too many incorrect codes. Start setup again.' });
+        }
+        req.session.twoFactorSettings = { ...challenge, attempts };
+        return res.status(400).json({ error: 'Incorrect verification code.' });
+    }
+
+    try {
+        await pool.query(`
+            UPDATE users
+            SET two_factor_method = CASE
+                    WHEN two_factor_method IN ('app', 'both') THEN 'both'
+                    ELSE 'email'
+                END,
+                two_factor_enabled_at = COALESCE(two_factor_enabled_at, NOW())
+            WHERE id = $1
+        `, [req.session.userId]);
+        clearTwoFactorSettingsChallenge(req);
+        res.json({ message: '2FA is now enabled with email.' });
+    } catch (err) {
+        console.error('2FA email confirm error:', err);
+        res.status(500).json({ error: 'Could not enable 2FA with email.' });
+    }
+});
+
+app.post('/api/settings/2fa/app/start', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });
+    const currentPassword = String(req.body.currentPassword || '');
+    if (!currentPassword) return res.status(400).json({ error: 'Enter your current password.' });
+
+    try {
+        const result = await pool.query('SELECT id, username, password_hash FROM users WHERE id = $1', [req.session.userId]);
+        const user = result.rows[0];
+        if (!user) return res.status(404).json({ error: 'User not found.' });
+        if (!await bcrypt.compare(currentPassword, user.password_hash)) {
+            return res.status(400).json({ error: 'Current password incorrect.' });
+        }
+
+        const secret = makeTotpSecret();
+        const uri = buildAuthenticatorUri(user.username, secret);
+        const qrDataUrl = await QRCode.toDataURL(uri, { width: 220, margin: 1, errorCorrectionLevel: 'M' });
+        req.session.twoFactorSettings = {
+            purpose: 'enable-app',
+            userId: Number(user.id),
+            secret,
+            expiresAt: Date.now() + TWO_FACTOR_CODE_TTL_MS,
+            attempts: 0,
+        };
+        res.json({
+            message: 'Scan the QR code, then enter the current 6-digit code from your authenticator app.',
+            method: 'app',
+            qrDataUrl,
+            secret,
+        });
+    } catch (err) {
+        console.error('2FA authenticator setup error:', err);
+        res.status(500).json({ error: 'Could not start authenticator setup.' });
+    }
+});
+
+app.post('/api/settings/2fa/app/confirm', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });
+    const challenge = req.session.twoFactorSettings;
+    if (!challenge || challenge.purpose !== 'enable-app' || Number(challenge.userId) !== Number(req.session.userId) || challenge.expiresAt <= Date.now()) {
+        clearTwoFactorSettingsChallenge(req);
+        return res.status(400).json({ error: 'Authenticator setup expired. Start setup again.' });
+    }
+
+    const code = normalizeTwoFactorCode(req.body.code);
+    if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter a valid 6-digit code.' });
+    if (!verifyTotpCode(challenge.secret, code)) {
+        const attempts = Number(challenge.attempts || 0) + 1;
+        if (attempts >= TWO_FACTOR_MAX_ATTEMPTS) {
+            clearTwoFactorSettingsChallenge(req);
+            return res.status(400).json({ error: 'Too many incorrect codes. Start setup again.' });
+        }
+        req.session.twoFactorSettings = { ...challenge, attempts };
+        return res.status(400).json({ error: 'That authenticator code is incorrect.' });
+    }
+
+    try {
+        const encryptedSecret = encryptTwoFactorSecret(challenge.secret);
+        await pool.query(`
+            UPDATE users
+            SET two_factor_method = CASE
+                    WHEN two_factor_method IN ('email', 'both') THEN 'both'
+                    ELSE 'app'
+                END,
+                two_factor_secret = $1,
+                two_factor_enabled_at = COALESCE(two_factor_enabled_at, NOW())
+            WHERE id = $2
+        `, [encryptedSecret, req.session.userId]);
+        clearTwoFactorSettingsChallenge(req);
+        res.json({ message: '2FA is now enabled with your authenticator app.' });
+    } catch (err) {
+        console.error('2FA authenticator confirm error:', err);
+        res.status(500).json({ error: 'Could not enable 2FA with your authenticator app.' });
+    }
+});
+
+app.post('/api/settings/2fa/disable/start', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });
+    const currentPassword = String(req.body.currentPassword || '');
+    const targetMethod = String(req.body.method || 'all').toLowerCase();
+    if (!currentPassword) return res.status(400).json({ error: 'Enter your current password.' });
+    if (!['all', 'email', 'app'].includes(targetMethod)) {
+        return res.status(400).json({ error: 'Invalid 2FA method.' });
+    }
+
+    try {
+        const result = await pool.query(`
+            SELECT id, username, email, password_hash, two_factor_method, two_factor_secret
+            FROM users WHERE id = $1
+        `, [req.session.userId]);
+        const user = result.rows[0];
+        if (!user) return res.status(404).json({ error: 'User not found.' });
+        if (!await bcrypt.compare(currentPassword, user.password_hash)) {
+            return res.status(400).json({ error: 'Current password incorrect.' });
+        }
+        const methods = getStoredTwoFactorMethods(user.two_factor_method);
+        if (!methods.length) return res.status(400).json({ error: '2FA is not enabled.' });
+        if (targetMethod !== 'all' && !methods.includes(targetMethod)) {
+            return res.status(400).json({ error: 'That 2FA method is not enabled.' });
+        }
+
+        const method = targetMethod === 'all'
+            ? (methods.includes('app') ? 'app' : 'email')
+            : targetMethod;
+        const challenge = {
+            purpose: 'disable-method',
+            userId: Number(user.id),
+            method,
+            targetMethod,
+            expiresAt: Date.now() + TWO_FACTOR_CODE_TTL_MS,
+            attempts: 0,
+        };
+        if (method === 'email') {
+            if (!user.email) return res.status(400).json({ error: 'Your account does not have an email address available for 2FA.' });
+            const code = generateEmailTwoFactorCode();
+            await sendTwoFactorCodeEmail(user.email, user.username, code, 'disable');
+            challenge.codeHash = hashTwoFactorCode(code, user.id, 'disable-email');
+        }
+        req.session.twoFactorSettings = challenge;
+        res.json({
+            method,
+            targetMethod,
+            message: method === 'email'
+                ? `A confirmation code was sent to ${maskEmailAddress(user.email)}.`
+                : 'Enter the current 6-digit code from your authenticator app to confirm this 2FA change.',
+        });
+    } catch (err) {
+        console.error('Disable 2FA start error:', err);
+        res.status(500).json({ error: 'Could not start disabling 2FA.' });
+    }
+});
+
+app.post('/api/settings/2fa/disable/confirm', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });
+    const challenge = req.session.twoFactorSettings;
+    if (!challenge || challenge.purpose !== 'disable-method' || Number(challenge.userId) !== Number(req.session.userId) || challenge.expiresAt <= Date.now()) {
+        clearTwoFactorSettingsChallenge(req);
+        return res.status(400).json({ error: 'The disable request expired. Start again.' });
+    }
+    const code = normalizeTwoFactorCode(req.body.code);
+    if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: 'Enter a valid 6-digit code.' });
+
+    try {
+        const result = await pool.query('SELECT two_factor_method, two_factor_secret FROM users WHERE id = $1', [req.session.userId]);
+        const user = result.rows[0];
+        if (!user) return res.status(404).json({ error: 'User not found.' });
+        const method = String(challenge.method || '').toLowerCase();
+        const targetMethod = String(challenge.targetMethod || 'all').toLowerCase();
+        const methods = getStoredTwoFactorMethods(user.two_factor_method);
+        if (!methods.includes(method) || (targetMethod !== 'all' && !methods.includes(targetMethod))) {
+            clearTwoFactorSettingsChallenge(req);
+            return res.status(400).json({ error: 'Your 2FA settings changed. Start again.' });
+        }
+
+        let valid = false;
+        if (method === 'email') {
+            valid = safeEqualText(hashTwoFactorCode(code, req.session.userId, 'disable-email'), challenge.codeHash);
+        } else if (method === 'app') {
+            valid = verifyTotpCode(decryptTwoFactorSecret(user.two_factor_secret), code);
+        }
+        if (!valid) {
+            const attempts = Number(challenge.attempts || 0) + 1;
+            if (attempts >= TWO_FACTOR_MAX_ATTEMPTS) {
+                clearTwoFactorSettingsChallenge(req);
+                return res.status(400).json({ error: 'Too many incorrect codes. Start again.' });
+            }
+            req.session.twoFactorSettings = { ...challenge, attempts };
+            return res.status(400).json({ error: 'Incorrect authentication code.' });
+        }
+
+        if (targetMethod === 'all' || methods.length === 1) {
+            await pool.query(`
+                UPDATE users
+                SET two_factor_method = NULL, two_factor_secret = NULL, two_factor_enabled_at = NULL
+                WHERE id = $1
+            `, [req.session.userId]);
+        } else if (targetMethod === 'email') {
+            await pool.query(`
+                UPDATE users
+                SET two_factor_method = 'app'
+                WHERE id = $1
+            `, [req.session.userId]);
+        } else if (targetMethod === 'app') {
+            await pool.query(`
+                UPDATE users
+                SET two_factor_method = 'email', two_factor_secret = NULL
+                WHERE id = $1
+            `, [req.session.userId]);
+        }
+
+        clearTwoFactorSettingsChallenge(req);
+        res.json({
+            message: targetMethod === 'all'
+                ? '2FA has been disabled.'
+                : 'That 2FA method has been disabled.'
+        });
+    } catch (err) {
+        console.error('Disable 2FA confirm error:', err);
+        res.status(500).json({ error: 'Could not disable 2FA.' });
+    }
+});
+
+
+function clearSensitiveTwoFactorChallenge(req) {
+    if (req.session) req.session.twoFactorSensitive = null;
+}
+
+async function requireSensitiveTwoFactor(req, res, user, purpose) {
+    const methods = getStoredTwoFactorMethods(user?.two_factor_method);
+    if (!methods.length) {
+        clearSensitiveTwoFactorChallenge(req);
+        return true;
+    }
+    
+    const method = methods.includes('app') ? 'app' : 'email';
+
+    const code = normalizeTwoFactorCode(req.body?.twoFactorCode);
+    const existing = req.session?.twoFactorSensitive;
+    const challengeMatches = existing
+        && Number(existing.userId) === Number(user.id)
+        && existing.purpose === purpose
+        && existing.method === method
+        && Number(existing.expiresAt || 0) > Date.now();
+
+    if (!code) {
+        const challenge = {
+            userId: Number(user.id),
+            purpose,
+            method,
+            expiresAt: Date.now() + TWO_FACTOR_CODE_TTL_MS,
+            attempts: 0,
+            lastSentAt: 0,
+        };
+
+        if (method === 'email') {
+            if (!user.email) {
+                return res.status(400).json({ error: 'Your account does not have an email address available for 2FA.' });
+            }
+            const emailCode = generateEmailTwoFactorCode();
+            await sendTwoFactorCodeEmail(user.email, user.username, emailCode, 'account-action');
+            challenge.codeHash = hashTwoFactorCode(emailCode, user.id, `sensitive:${purpose}`);
+            challenge.lastSentAt = Date.now();
+        }
+
+        req.session.twoFactorSensitive = challenge;
+        res.status(428).json({
+            twoFactorRequired: true,
+            twoFactorPurpose: purpose,
+            method,
+            message: method === 'email'
+                ? `A 6-digit confirmation code was sent to ${maskEmailAddress(user.email)}.`
+                : 'Enter the current 6-digit code from your authenticator app.',
+        });
+        return false;
+    }
+
+    if (!/^\d{6}$/.test(code)) {
+        return res.status(400).json({ error: 'Enter a valid 6-digit two-factor code.' });
+    }
+    if (!challengeMatches) {
+        clearSensitiveTwoFactorChallenge(req);
+        return res.status(428).json({
+            twoFactorRequired: true,
+            twoFactorPurpose: purpose,
+            method,
+            message: 'Your confirmation request expired. Try the account action again.',
+        });
+    }
+
+    let valid = false;
+    if (method === 'email') {
+        valid = safeEqualText(
+            hashTwoFactorCode(code, user.id, `sensitive:${purpose}`),
+            existing.codeHash
+        );
+    } else if (method === 'app') {
+        try {
+            valid = verifyTotpCode(decryptTwoFactorSecret(user.two_factor_secret), code);
+        } catch (err) {
+            console.error('Sensitive authenticator verification error:', err);
+        }
+    }
+
+    if (!valid) {
+        const attempts = Number(existing.attempts || 0) + 1;
+        if (attempts >= TWO_FACTOR_MAX_ATTEMPTS) {
+            clearSensitiveTwoFactorChallenge(req);
+            return res.status(401).json({ error: 'Too many incorrect two-factor codes. Try the account action again.' });
+        }
+        req.session.twoFactorSensitive = { ...existing, attempts };
+        return res.status(401).json({ error: 'Incorrect authentication code.', twoFactorRetry: true });
+    }
+
+    clearSensitiveTwoFactorChallenge(req);
+    return true;
+}
+
+app.post('/api/settings/2fa/action/resend', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Unauthorized' });
+    const challenge = req.session?.twoFactorSensitive;
+    const purpose = String(req.body?.purpose || '');
+    if (!challenge || challenge.method !== 'email' || challenge.purpose !== purpose || Number(challenge.userId) !== Number(req.session.userId) || challenge.expiresAt <= Date.now()) {
+        clearSensitiveTwoFactorChallenge(req);
+        return res.status(400).json({ error: 'That two-factor confirmation request expired. Try the account action again.' });
+    }
+    const elapsed = Date.now() - Number(challenge.lastSentAt || 0);
+    if (elapsed < TWO_FACTOR_RESEND_COOLDOWN_MS) {
+        return res.status(429).json({ error: `Please wait ${Math.ceil((TWO_FACTOR_RESEND_COOLDOWN_MS - elapsed) / 1000)} seconds before requesting another code.` });
+    }
+
+    try {
+        const result = await pool.query('SELECT id, username, email, two_factor_method FROM users WHERE id = $1', [req.session.userId]);
+        const user = result.rows[0];
+        if (!user || !hasStoredTwoFactorMethod(user.two_factor_method, 'email') || !user.email) {
+            clearSensitiveTwoFactorChallenge(req);
+            return res.status(400).json({ error: '2FA by email is no longer available for this account.' });
+        }
+        const code = generateEmailTwoFactorCode();
+        await sendTwoFactorCodeEmail(user.email, user.username, code, 'account-action');
+        req.session.twoFactorSensitive = {
+            ...challenge,
+            codeHash: hashTwoFactorCode(code, user.id, `sensitive:${purpose}`),
+            expiresAt: Date.now() + TWO_FACTOR_CODE_TTL_MS,
+            attempts: 0,
+            lastSentAt: Date.now(),
+        };
+        return res.json({ message: `A new code was sent to ${maskEmailAddress(user.email)}.` });
+    } catch (err) {
+        console.error('Sensitive two-factor resend error:', err);
+        return res.status(500).json({ error: 'Could not send another confirmation code.' });
+    }
+});
+
+app.get('/api/settings/profile', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: "Unauthorized" });
+
+    try {
+        const userResult = await pool.query(`
+            SELECT username, email,
+                   display_name, bio, pronouns, country,
+                   social_youtube, social_twitter, social_twitch, social_discord, social_reddit, social_gdbrowser, discord_username,
+                   icon_type, icon_id, color1, color2, glow
+            FROM users
+            WHERE id = $1
+        `, [req.session.userId]);
+
+        if (userResult.rows.length === 0) return res.status(404).json({ error: "User not found" });
+
+        const user = userResult.rows[0];
+        res.json({
+            username: user.username,
+            email: user.email || '',
+            ...serializeProfileUser(user),
+        });
+    } catch (err) {
+        console.error("Profile settings load error:", err);
+        res.status(500).json({ error: "Server error." });
+    }
+});
+
+app.post('/api/settings/profile', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const rawDisplayName = String(req.body.displayName || '');
+    const displayNameError = validateDisplayName(rawDisplayName);
+    if (displayNameError) {
+        return res.status(400).json({ error: displayNameError });
+    }
+
+    const socialLinks = req.body.socialLinks || {};
+    const rawIcon = req.body.icon || {};
+    const iconError = validateProfileIcon(rawIcon);
+    if (iconError) {
+        return res.status(400).json({ error: iconError });
+    }
+    const icon = cleanProfileIcon(rawIcon);
+
+    const profile = {
+        displayName: cleanProfileText(rawDisplayName, 30),
+        bio: cleanProfileText(req.body.bio, 500),
+        pronouns: cleanProfileText(req.body.pronouns, 60),
+        country: cleanProfileText(req.body.country, 80),
+        youtube: cleanProfileText(socialLinks.youtube, 200),
+        twitter: cleanProfileText(socialLinks.twitter, 200),
+        twitch: cleanProfileText(socialLinks.twitch, 200),
+        reddit: cleanProfileText(socialLinks.reddit, 200),
+        gdbrowser: cleanProfileText(socialLinks.gdbrowser, 200),
+        iconType: icon.type,
+        iconId: icon.id,
+        color1: icon.color1,
+        color2: icon.color2,
+        glow: icon.glow,
+    };
+
+    try {
+        await pool.query(`
+            UPDATE users
+            SET display_name = $1,
+                bio = $2,
+                pronouns = $3,
+                country = $4,
+                social_youtube = $5,
+                social_twitter = $6,
+                social_twitch = $7,
+                social_reddit = $8,
+                social_gdbrowser = $9,
+                icon_type = $10,
+                icon_id = $11,
+                color1 = $12,
+                color2 = $13,
+                glow = $14
+            WHERE id = $15
+        `, [
+            profile.displayName,
+            profile.bio,
+            profile.pronouns,
+            profile.country,
+            profile.youtube,
+            profile.twitter,
+            profile.twitch,
+            profile.reddit,
+            profile.gdbrowser,
+            profile.iconType,
+            profile.iconId,
+            profile.color1,
+            profile.color2,
+            profile.glow,
+            req.session.userId,
+        ]);
+
+        res.json({ message: "Profile updated successfully!" });
+    } catch (err) {
+        console.error("Profile settings update error:", err);
+        res.status(500).json({ error: "Server error." });
+    }
+});
+
+app.post('/api/settings/username', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: "Unauthorized" });
+    
+    const { username } = req.body;
+    const formatError = validateUsername(username);
+    if (formatError) return res.status(400).json({ error: formatError });
+
+    try {
+        const existingUser = await pool.query(
+            'SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND id != $2',
+            [username, req.session.userId]
+        );
+        
+        if (existingUser.rows.length > 0) {
+            return res.status(400).json({ error: "That username is already taken." });
+        }
+
+        await pool.query(
+            'UPDATE users SET username = $1 WHERE id = $2', 
+            [username, req.session.userId]
+        );
+
+        req.session.username = username;
+        res.json({ message: "Username updated successfully!" });
+    } catch (err) {
+        console.error("Username update error:", err);
+        res.status(500).json({ error: "Server error." });
+    }
+});
+
+app.post('/api/settings/email', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const email = normalizeEmail(req.body.email);
+    const emailIdentity = getEmailIdentity(email);
+    const currentPassword = String(req.body.currentPassword || '');
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: "Please enter a valid email address." });
+    }
+    if (!emailIdentity) {
+        return res.status(400).json({ error: "Email validation failed. Please try a different email." });
+    }
+    if (!currentPassword) {
+        return res.status(400).json({ error: "Enter your current password to change your email." });
+    }
+
+    let verificationToken = null;
+    let username = null;
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [emailIdentity]);
+
+        const userResult = await client.query(
+            'SELECT id, username, password_hash, email, two_factor_method, two_factor_secret FROM users WHERE id = $1 FOR UPDATE',
+            [req.session.userId]
+        );
+        const user = userResult.rows[0];
+        if (!user) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "User not found." });
+        }
+        username = user.username;
+
+        const validPassword = await bcrypt.compare(currentPassword, user.password_hash);
+        if (!validPassword) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "Current password incorrect." });
+        }
+        if (!await requireSensitiveTwoFactor(req, res, user, 'change-email')) {
+            await client.query('ROLLBACK');
+            return;
+        }
+        if (getEmailIdentity(user.email) === emailIdentity) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "That is already your current email address." });
+        }
+
+        const duplicate = await client.query(`
+            SELECT id FROM users WHERE ${emailIdentitySql('email')} = $1 AND id != $2
+            UNION ALL
+            SELECT NULL AS id FROM pending_users WHERE ${emailIdentitySql('email')} = $1
+            UNION ALL
+            SELECT user_id AS id
+            FROM pending_email_changes
+            WHERE ${emailIdentitySql('email')} = $1
+              AND user_id != $2
+              AND expires_at > NOW()
+            LIMIT 1
+        `, [emailIdentity, req.session.userId]);
+        if (duplicate.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "That email is already in use." });
+        }
+
+        verificationToken = randomBytes(32).toString('hex');
+        const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+        await client.query('DELETE FROM pending_email_changes WHERE expires_at <= NOW() OR user_id = $1', [
+            req.session.userId,
+        ]);
+        await client.query(`
+            INSERT INTO pending_email_changes (token, user_id, email, expires_at)
+            VALUES ($1, $2, $3, $4)
+        `, [verificationToken, req.session.userId, email, expiresAt]);
+        await client.query('COMMIT');
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Email update error:', err);
+        return res.status(500).json({ error: "Could not prepare the email verification message." });
+    } finally {
+        client.release();
+    }
+
+    const verifyLink = `https://webdemonlist.org/verify?token=${verificationToken}&type=email-change`;
+    try {
+        await sendEmailChangeVerification(email, username, verifyLink);
+        return res.json({
+            message: "Verification sent to the provided email.",
+            pendingEmail: email,
+        });
+    } catch (emailError) {
+        await pool.query('DELETE FROM pending_email_changes WHERE token = $1', [verificationToken]).catch(() => {});
+        console.error('Email update error:', emailError);
+        return res.status(500).json({ error: "Could not send the email verification message." });
+    }
+});
+
+app.post('/api/settings/password', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: "Unauthorized" });
+    const { currentPassword, newPassword } = req.body;
+
+    const passError = validatePassword(newPassword);
+    if (passError) return res.status(400).json({ error: passError });
+
+    try {
+        const userRes = await pool.query(`
+            SELECT id, username, email, password_hash, two_factor_method, two_factor_secret
+            FROM users WHERE id = $1
+        `, [req.session.userId]);
+        const user = userRes.rows[0];
+        if (!user) return res.status(404).json({ error: 'User not found.' });
+        
+        const isMatch = await bcrypt.compare(currentPassword, user.password_hash);
+        if (!isMatch) return res.status(400).json({ error: "Current password incorrect." });
+        if (!await requireSensitiveTwoFactor(req, res, user, 'change-password')) return;
+
+        const hashedNewPassword = await bcrypt.hash(newPassword, 10);
+        
+        await pool.query('UPDATE users SET password_hash = $1 WHERE id = $2', [hashedNewPassword, req.session.userId]);
+        
+        res.json({ message: "Password updated!" });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Server error." });
+    }
+});
+
+app.delete('/api/settings/delete', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: "Unauthorized" });
+
+    const { password } = req.body;
+    const userId = Number(req.session.userId);
+    const client = await pool.connect();
+    let newUsername = null;
+
+    try {
+        await client.query('BEGIN');
+
+        const userRes = await client.query(`
+            SELECT id, username, email, password_hash, role, two_factor_method, two_factor_secret
+            FROM users
+            WHERE id = $1
+            FOR UPDATE
+        `, [userId]);
+        const user = userRes.rows[0];
+        if (!user) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "User not found." });
+        }
+
+        const isMatch = await bcrypt.compare(password, user.password_hash);
+        if (!isMatch) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "Incorrect password. Account was not deleted." });
+        }
+        if (!await requireSensitiveTwoFactor(req, res, user, 'delete-account')) {
+            await client.query('ROLLBACK');
+            return;
+        }
+
+        if (isStaffRole(user.role)) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: "Staff accounts cannot be deleted this way." });
+        }
+
+        for (let attempt = 0; attempt < 20; attempt++) {
+            const candidate = makeResetAccountUsername();
+            const duplicate = await client.query(`
+                SELECT 1 FROM users WHERE LOWER(username) = LOWER($1)
+                UNION ALL
+                SELECT 1 FROM pending_users WHERE LOWER(username) = LOWER($1)
+                LIMIT 1
+            `, [candidate]);
+            if (!duplicate.rows.length) {
+                newUsername = candidate;
+                break;
+            }
+        }
+        if (!newUsername) throw new Error('Could not generate a unique reset username.');
+
+        await client.query(`
+            UPDATE users
+            SET account_disabled = TRUE,
+                account_disabled_reason = 'Account Deleted!',
+                account_disabled_at = NOW(),
+                account_disabled_by = NULL
+            WHERE id = $1
+        `, [userId]);
+
+        await client.query(`
+            DELETE FROM notifications
+            WHERE user_id = $1 OR actor_id = $1
+        `, [userId]);
+
+        await client.query(`
+            DELETE FROM verifications
+            WHERE user_id = $1 AND status IN ('pending', 'rejected')
+        `, [userId]);
+        await client.query('DELETE FROM records WHERE user_id = $1', [userId]);
+
+        await client.query('DELETE FROM pending_email_changes WHERE user_id = $1', [userId]);
+
+        await client.query(`
+            UPDATE users
+            SET username = $1,
+                display_name = '',
+                bio = '',
+                pronouns = '',
+                country = '',
+                social_youtube = '',
+                social_twitter = '',
+                social_twitch = '',
+                social_discord = '',
+                social_reddit = '',
+                social_gdbrowser = '',
+                discord_id = NULL,
+                discord_username = NULL,
+                icon_type = 'cube',
+                icon_id = 1,
+                color1 = 1,
+                color2 = 3,
+                glow = -1,
+                badges = '[]'::jsonb,
+                submission_notifications = FALSE,
+                submission_discord_ping = FALSE,
+                verification_notifications = FALSE,
+                verification_discord_ping = FALSE,
+                two_factor_method = NULL,
+                two_factor_secret = NULL,
+                two_factor_enabled_at = NULL
+            WHERE id = $2
+        `, [newUsername, userId]);
+
+        await client.query('COMMIT');
+
+        for (const list of ['primary', 'impossible']) {
+            const sync = await syncLeaderboardTopOne(list);
+            for (const changedUserId of sync.changedUserIds || []) {
+                if (changedUserId) await evaluateUserBadges(changedUserId, list);
+            }
+        }
+
+        req.session = null;
+        res.json({ message: "Account deleted." });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Account deletion/reset error:', err);
+        res.status(500).json({ error: "Server error during deletion." });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/notifications', async (req, res) => {
+    if (!req.session.userId) return res.status(401).json([]);
+
+    try {
+        const result = await pool.query(`
+            SELECT
+                n.id,
+                n.subject,
+                n.body,
+                n.created_at,
+                n.is_read,
+                n.type,
+                n.list_type,
+                COALESCE(NULLIF(u.display_name, ''), u.username, n.sender_name, 'WBDL') AS sent_by
+            FROM notifications n
+            LEFT JOIN users u ON n.actor_id = u.id
+            WHERE n.user_id = $1
+            ORDER BY n.created_at DESC, n.id DESC
+        `, [req.session.userId]);
+
+        res.json(result.rows.map(row => ({
+            ...row,
+            subject: row.subject || 'Notification',
+            body: row.body || '',
+            sent_by: row.sent_by || 'WBDL',
+        })));
+    } catch (err) {
+        console.error('Notification fetch error:', err);
+        res.status(500).json({ error: "Database error" });
+    }
+});
+
+app.post('/api/notifications/read', async (req, res) => {
+    if (!req.session.userId) return res.sendStatus(401);
+    const notificationId = parseInt(req.body?.notificationId, 10);
+
+    try {
+        if (Number.isInteger(notificationId)) {
+            await pool.query(
+                'UPDATE notifications SET is_read = TRUE WHERE id = $1 AND user_id = $2',
+                [notificationId, req.session.userId]
+            );
+        } else {
+            await pool.query(
+                'UPDATE notifications SET is_read = TRUE WHERE user_id = $1',
+                [req.session.userId]
+            );
+        }
+        res.sendStatus(200);
+    } catch (err) {
+        console.error('Notification read error:', err);
+        res.sendStatus(500);
+    }
+});
+
+
+app.delete('/api/notifications/:id', async (req, res) => {
+    if (!req.session.userId) return res.sendStatus(401);
+    const notificationId = Number.parseInt(req.params.id, 10);
+    if (!Number.isInteger(notificationId)) {
+        return res.status(400).json({ error: 'Invalid notification.' });
+    }
+
+    try {
+        const result = await pool.query(
+            'DELETE FROM notifications WHERE id = $1 AND user_id = $2 RETURNING id',
+            [notificationId, req.session.userId]
+        );
+        if (!result.rows.length) {
+            return res.status(404).json({ error: 'Notification not found.' });
+        }
+        res.json({ message: 'Notification deleted.' });
+    } catch (err) {
+        console.error('Notification delete error:', err);
+        res.status(500).json({ error: 'Could not delete notification.' });
+    }
+});
+
+app.get('/api/demons/:id/history', async (req, res) => {
+    const demonId = parseInt(req.params.id, 10);
+    const client = await pool.connect();
+
+    try {
+        const currentRes = await client.query(
+            'SELECT position, list_type FROM demons WHERE id = $1',
+            [demonId]
+        );
+
+        if (currentRes.rows.length === 0) {
+            const lifeCheck = await client.query(
+                "SELECT old_position, list_type FROM changelog WHERE demon_id = $1 AND change_type = 'deleted' LIMIT 1",
+                [demonId]
+            );
+
+            if (lifeCheck.rows.length === 0) {
+                return res.status(404).json({ error: "Demon not found in list or records" });
+            }
+
+            return res.json([]);
+        }
+
+        const { position: currentActualPosRaw, list_type: listType } = currentRes.rows[0];
+        const currentActualPos = parseInt(currentActualPosRaw, 10);
+
+        const changelogRes = await client.query(
+            `SELECT id, demon_id, demon_name, change_type, old_position, new_position, created_at 
+             FROM changelog 
+             WHERE list_type = $1 
+             ORDER BY created_at DESC, id DESC`,
+            [listType]
+        );
+
+        const virtualHistory = [];
+        let simulatedPos = currentActualPos;
+
+        for (const log of changelogRes.rows) {
+            let generatedLog = null;
+
+            if (log.demon_id === demonId) {
+                if (log.change_type === 'added') {
+                    generatedLog = {
+                        created_at: log.created_at,
+                        change_type: 'added',
+                        new_position: simulatedPos,
+                        diff: 0,
+                        reason: "Placed on the list"
+                    };
+                    virtualHistory.push(generatedLog);
+                    break;
+                } else if (log.change_type === 'moved') {
+                    const oldPos = parseInt(log.old_position, 10);
+                    const newPos = parseInt(log.new_position, 10);
+
+                    const diff = oldPos - newPos;
+
+                    generatedLog = {
+                        created_at: log.created_at,
+                        change_type: 'moved',
+                        new_position: newPos,
+                        diff: diff,
+                        reason: diff > 0 ? "Raised" : "Lowered"
+                    };
+
+                    virtualHistory.push(generatedLog);
+
+                    simulatedPos = oldPos;
+                    continue;
+                }
+            }
+
+            const logOldPos = log.old_position ? parseInt(log.old_position, 10) : null;
+            const logNewPos = log.new_position ? parseInt(log.new_position, 10) : null;
+
+            if (log.change_type === 'added') {
+                if (logNewPos <= simulatedPos) {
+                    const diff = -1;
+                    generatedLog = {
+                        created_at: log.created_at,
+                        change_type: 'indirect',
+                        new_position: simulatedPos,
+                        diff: diff,
+                        reason: `**${log.demon_name}** was added above`
+                    };
+                    virtualHistory.push(generatedLog);
+                    simulatedPos -= 1;
+                }
+            } else if (log.change_type === 'deleted') {
+                if (logOldPos <= simulatedPos) {
+                    const diff = 1;
+                    generatedLog = {
+                        created_at: log.created_at,
+                        change_type: 'indirect',
+                        new_position: simulatedPos,
+                        diff: diff,
+                        reason: `**${log.demon_name}** was removed above`
+                    };
+                    virtualHistory.push(generatedLog);
+                    simulatedPos += 1;
+                }
+            } else if (log.change_type === 'moved') {
+                let operationalPos = simulatedPos;
+                if (logNewPos <= operationalPos) {
+                    operationalPos -= 1;
+                }
+                if (logOldPos <= operationalPos) {
+                    operationalPos += 1;
+                }
+
+                const positionShift = operationalPos - simulatedPos;
+
+                if (positionShift !== 0) {
+                    generatedLog = {
+                        created_at: log.created_at,
+                        change_type: 'indirect',
+                        new_position: simulatedPos,
+                        diff: positionShift,
+                        reason: positionShift > 0
+                            ? `**${log.demon_name}** was moved down past this level`
+                            : `**${log.demon_name}** was raised past this level`
+                    };
+                    virtualHistory.push(generatedLog);
+                }
+
+                simulatedPos = operationalPos;
+            }
+        }
+
+        res.json(virtualHistory);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Error reconstructing dynamic history" });
+    } finally {
+        client.release();
+    }
+});
+
+app.get('/api/changelog', async (req, res) => {
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    try {
+        const result = await pool.query(`
+            SELECT 
+                demon_id,
+                demon_name, 
+                change_type, 
+                old_position, 
+                new_position, 
+                created_at 
+            FROM changelog 
+            WHERE change_type IN ('added', 'moved', 'deleted') 
+              AND list_type = $1
+            ORDER BY created_at DESC 
+            LIMIT 50
+        `, [list]);
+
+        const formattedLogs = result.rows.map(log => {
+            return {
+                date: log.created_at,
+                demonId: log.demon_id,
+                demonName: log.demon_name,
+                changeType: log.change_type,
+                oldPosition: log.old_position,
+                newPosition: log.new_position,
+            };
+        });
+
+        res.json(formattedLogs);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to fetch changelog" });
+    }
+});
+
+app.get('/api/staff', async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT id, username, display_name, role 
+            FROM users 
+            WHERE role IN ('owner', 'admin', 'moderator')
+            ORDER BY 
+                CASE role 
+                    WHEN 'owner' THEN 1 
+                    WHEN 'admin' THEN 2 
+                    WHEN 'moderator' THEN 3 
+                END ASC, 
+                LOWER(COALESCE(NULLIF(display_name, ''), username)) ASC,
+                username ASC
+        `);
+
+        const staffRows = result.rows.map(u => ({
+            username: u.username,
+            displayName: u.display_name || u.username,
+            role: u.role
+        }));
+
+        const staff = {
+            owners: staffRows.filter(u => u.role === 'owner'),
+            admins: staffRows.filter(u => u.role === 'admin'),
+            moderators: staffRows.filter(u => u.role === 'moderator')
+        };
+
+        res.json(staff);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to fetch staff list" });
+    }
+});
+
+app.get('/api/globalstats', async (req, res) => {
+    try {
+        const query = `
+            SELECT 
+                (SELECT COUNT(*) FROM demons) as total_demons,
+                (SELECT COUNT(*) FROM records WHERE status = 'accepted') as total_records,
+                (
+                    SELECT COUNT(DISTINCT u.id) 
+                    FROM users u
+                    JOIN records r ON u.id = r.user_id
+                    JOIN demons d ON r.demon_id = d.id
+                    WHERE r.status = 'accepted'
+                ) as total_players
+        `;
+
+        const result = await pool.query(query);
+        const stats = result.rows[0];
+
+        res.json({
+            demons: parseInt(stats.total_demons),
+            records: parseInt(stats.total_records),
+            players: parseInt(stats.total_players)
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to fetch global stats" });
+    }
+});
+
+function fixVideoUrl(url) {
+    if (typeof url !== 'string') return url;
+    try {
+        const parsed = new URL(url.trim());
+        if (
+            (parsed.hostname === 'youtube.com' || parsed.hostname === 'www.youtube.com') &&
+            parsed.pathname.startsWith('/shorts/')
+        ) {
+            const videoId = parsed.pathname.split('/shorts/')[1]?.split('/')[0];
+            if (videoId) {
+                return `https://www.youtube.com/watch?v=${videoId}`;
+            }
+        }
+    } catch (err) {}
+    return url;
+}
+
+app.post('/api/submit-verification', async (req, res) => {
+    const { name, author, levelId, opinion, videoUrl, enjoymentRating } = req.body;
+    const rawFootageUrl = String(req.body.rawFootageUrl || '').trim();
+    const normalizedRawFootage = rawFootageUrl ? normalizeVideoSubmission(rawFootageUrl) : null;
+    const comments = cleanProfileText(req.body.comments, 1000);
+    if (String(req.body.comments ?? '').trim().length > 1000) {
+        return res.status(400).json({ error: "Comments are limited to 1000 characters." });
+    }
+    const userId = req.session.userId;
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    if (!userId) return res.status(401).json({ error: "Unauthorized" });
+
+    if (typeof name !== 'string' || name.trim().length > 20) {
+        return res.status(400).json({ error: "Level name is too long." });
+    }
+
+    const placementOpinion = parseInt(opinion, 10);
+    const normalizedEnjoyment = list === 'impossible'
+        ? null
+        : normalizeEnjoymentRating(enjoymentRating, 100);
+    const normalizedVideo = normalizeVideoSubmission(videoUrl);
+    if (!normalizedVideo) {
+        return res.status(400).json({ error: "Video link is not from an allowed domain." });
+    }
+    if (rawFootageUrl && !normalizedRawFootage) {
+        return res.status(400).json({ error: "Raw footage link is not from an allowed domain." });
+    }
+    if (!Number.isInteger(placementOpinion) || placementOpinion < 1 || placementOpinion > 150) {
+        return res.status(400).json({ error: "You can't submit for the legacy list." });
+    }
+    if (list !== 'impossible'
+        && enjoymentRating !== ''
+        && enjoymentRating !== null
+        && enjoymentRating !== undefined
+        && normalizedEnjoyment === null) {
+        return res.status(400).json({ error: "Enjoyment rating must be between 1 and 10." });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const restriction = await getSubmissionRestriction(client, userId);
+        if (restriction) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: restriction });
+        }
+
+        const rateLimitError = await getNewAccountSubmissionRateLimit(client, userId);
+        if (rateLimitError) {
+            await client.query('ROLLBACK');
+            return res.status(429).json({ error: rateLimitError });
+        }
+
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [normalizedVideo.key]);
+        const canReuseOwnVideo = await canReuseOwnSubmissionVideo(client, userId);
+        const reuse = await findActiveVideoReuse(client, normalizedVideo.key, {
+            allowOwnUserId: canReuseOwnVideo ? userId : null,
+        });
+        if (reuse) {
+            await client.query('ROLLBACK');
+            return res.json({ message: "That video has already been used." });
+        }
+
+        const insertedVerification = await client.query(
+            `INSERT INTO verifications
+                (user_id, level_name, level_author, level_id, video_url, raw_footage_url, placement_opinion, list_type, enjoyment_rating, submission_comments)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             RETURNING id`,
+            [userId, name, author, levelId, normalizedVideo.cleanUrl, normalizedRawFootage?.cleanUrl || null, placementOpinion, list, normalizedEnjoyment, comments || null]
+        );
+        const verificationId = Number(insertedVerification.rows[0]?.id);
+        await client.query('COMMIT');
+
+        await notifyVerificationSubscribers({
+            verificationId,
+            submitterId: userId,
+            levelName: String(name || '').trim(),
+            levelAuthor: String(author || '').trim(),
+            levelId,
+            placementOpinion,
+            videoUrl: normalizedVideo.cleanUrl,
+            listType: list,
+        });
+
+        return res.json({ message: "Verification submitted successfully!" });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error(err);
+        return res.status(500).json({ error: "Database error during submission." });
+    } finally {
+        client.release();
+    }
+});
+
+
+const CLAN_NAME_PATTERN = /^[A-Za-z0-9]{1,4}$/;
+const CLAN_MAX_MEMBERS = 6;
+const CLAN_DESCRIPTION_MAX_LENGTH = 50;
+const CLAN_ICON_MAX_BYTES = 100 * 1024;
+const CLAN_ICON_MAX_DIMENSION = 4096;
+
+function normalizeClanName(value) {
+    return String(value || '').trim().toUpperCase();
+}
+
+function normalizeClanDescription(value) {
+    return String(value || '').trim().slice(0, CLAN_DESCRIPTION_MAX_LENGTH);
+}
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function isValidClanPng(data) {
+    if (data.length < PNG_SIGNATURE.length + 12 || !data.subarray(0, 8).equals(PNG_SIGNATURE)) return false;
+
+    let offset = 8;
+    let sawHeader = false;
+    let sawData = false;
+    let sawEnd = false;
+
+    while (offset + 12 <= data.length) {
+        const chunkLength = data.readUInt32BE(offset);
+        const chunkType = data.toString('ascii', offset + 4, offset + 8);
+        const chunkEnd = offset + 12 + chunkLength;
+
+        if (!/^[A-Za-z]{4}$/.test(chunkType) || chunkEnd > data.length) return false;
+
+        if (chunkType === 'IHDR') {
+            if (sawHeader || offset !== 8 || chunkLength !== 13) return false;
+
+            const width = data.readUInt32BE(offset + 8);
+            const height = data.readUInt32BE(offset + 12);
+            const bitDepth = data[offset + 16];
+            const colorType = data[offset + 17];
+
+            const validBitDepths = {
+                0: [1, 2, 4, 8, 16],
+                2: [8, 16],
+                3: [1, 2, 4, 8],
+                4: [8, 16],
+                6: [8, 16],
+            };
+
+            if (
+                width < 1 || width > CLAN_ICON_MAX_DIMENSION
+                || height < 1 || height > CLAN_ICON_MAX_DIMENSION
+                || !validBitDepths[colorType]?.includes(bitDepth)
+            ) {
+                return false;
+            }
+
+            sawHeader = true;
+        } else if (chunkType === 'IDAT') {
+            if (!sawHeader || sawEnd) return false;
+            sawData = sawData || chunkLength > 0;
+        } else if (chunkType === 'IEND') {
+            if (!sawHeader || !sawData || chunkLength !== 0) return false;
+            sawEnd = true;
+            offset = chunkEnd;
+            break;
+        }
+
+        offset = chunkEnd;
+    }
+
+    return sawHeader && sawData && sawEnd && offset === data.length;
+}
+
+function isJpegSofMarker(marker) {
+    return (
+        (marker >= 0xc0 && marker <= 0xc3)
+        || (marker >= 0xc5 && marker <= 0xc7)
+        || (marker >= 0xc9 && marker <= 0xcb)
+        || (marker >= 0xcd && marker <= 0xcf)
+    );
+}
+
+function isValidClanJpeg(data) {
+    if (data.length < 4 || data[0] !== 0xff || data[1] !== 0xd8) return false;
+
+    let offset = 2;
+    let sawSof = false;
+
+    while (offset + 1 < data.length) {
+        if (data[offset] !== 0xff) return false;
+        while (offset < data.length && data[offset] === 0xff) offset++;
+        if (offset >= data.length) return false;
+
+        const marker = data[offset++];
+        if (marker === 0xd9) return sawSof;
+        if (marker === 0x00) return false;
+
+        if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+
+        if (offset + 2 > data.length) return false;
+        const segmentLength = data.readUInt16BE(offset);
+        if (segmentLength < 2 || offset + segmentLength > data.length) return false;
+
+        if (isJpegSofMarker(marker)) {
+            if (segmentLength < 7) return false;
+            const height = data.readUInt16BE(offset + 3);
+            const width = data.readUInt16BE(offset + 5);
+            if (
+                width < 1 || width > CLAN_ICON_MAX_DIMENSION
+                || height < 1 || height > CLAN_ICON_MAX_DIMENSION
+            ) {
+                return false;
+            }
+            sawSof = true;
+        }
+
+        if (marker === 0xda) {
+            const eoi = data.lastIndexOf(Buffer.from([0xff, 0xd9]));
+            return sawSof && eoi >= offset + segmentLength;
+        }
+
+        offset += segmentLength;
+    }
+
+    return false;
+}
+
+function readUint24LE(buffer, offset) {
+    return buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+}
+
+function isValidClanWebp(data) {
+    if (data.length < 16) return false;
+    if (data.toString('ascii', 0, 4) !== 'RIFF' || data.toString('ascii', 8, 12) !== 'WEBP') return false;
+    if (data.readUInt32LE(4) !== data.length - 8) return false;
+
+    let offset = 12;
+    let hasImageChunk = false;
+
+    while (offset + 8 <= data.length) {
+        const chunkType = data.toString('ascii', offset, offset + 4);
+        const chunkSize = data.readUInt32LE(offset + 4);
+        const chunkDataEnd = offset + 8 + chunkSize;
+        const paddedEnd = chunkDataEnd + (chunkSize & 1);
+
+        if (!/^[\x20-\x7e]{4}$/.test(chunkType) || chunkDataEnd > data.length || paddedEnd > data.length) return false;
+
+        if (chunkType === 'VP8 ') {
+            if (chunkSize < 10) return false;
+            if (data[offset + 11] !== 0x9d || data[offset + 12] !== 0x01 || data[offset + 13] !== 0x2a) return false;
+
+            const width = data.readUInt16LE(offset + 14) & 0x3fff;
+            const height = data.readUInt16LE(offset + 16) & 0x3fff;
+            if (
+                width < 1 || width > CLAN_ICON_MAX_DIMENSION
+                || height < 1 || height > CLAN_ICON_MAX_DIMENSION
+            ) {
+                return false;
+            }
+            hasImageChunk = true;
+        } else if (chunkType === 'VP8L') {
+            if (chunkSize < 5 || data[offset + 8] !== 0x2f) return false;
+
+            const b0 = data[offset + 9];
+            const b1 = data[offset + 10];
+            const b2 = data[offset + 11];
+            const b3 = data[offset + 12];
+            const width = ((b0 | (b1 << 8)) & 0x3fff) + 1;
+            const height = (((b1 >> 6) | (b2 << 2) | ((b3 & 0x3f) << 10)) & 0x3fff) + 1;
+
+            if (
+                width < 1 || width > CLAN_ICON_MAX_DIMENSION
+                || height < 1 || height > CLAN_ICON_MAX_DIMENSION
+            ) {
+                return false;
+            }
+            hasImageChunk = true;
+        } else if (chunkType === 'VP8X') {
+            if (chunkSize < 10) return false;
+
+            const width = readUint24LE(data, offset + 12) + 1;
+            const height = readUint24LE(data, offset + 15) + 1;
+            if (
+                width < 1 || width > CLAN_ICON_MAX_DIMENSION
+                || height < 1 || height > CLAN_ICON_MAX_DIMENSION
+            ) {
+                return false;
+            }
+            hasImageChunk = true;
+        }
+
+        offset = paddedEnd;
+    }
+
+    return hasImageChunk && offset === data.length;
+}
+
+function isValidClanImageBuffer(data, mimeType) {
+    switch (String(mimeType || '').toLowerCase()) {
+        case 'image/png':
+            return isValidClanPng(data);
+        case 'image/jpeg':
+            return isValidClanJpeg(data);
+        case 'image/webp':
+            return isValidClanWebp(data);
+        default:
+            return false;
+    }
+}
+
+function parseClanIconDataUrl(value) {
+    const match = String(value || '').match(/^data:(image\/(?:webp|png|jpeg));base64,([A-Za-z0-9+/]+={0,2})$/i);
+    if (!match) return null;
+
+    const payload = match[2];
+    if (payload.length % 4 !== 0) return null;
+
+    let data;
+    try {
+        data = Buffer.from(payload, 'base64');
+    } catch (_) {
+        return null;
+    }
+
+    if (data.toString('base64') !== payload) return null;
+    if (!data.length || data.length > CLAN_ICON_MAX_BYTES) return null;
+
+    const mimeType = match[1].toLowerCase();
+    if (!isValidClanImageBuffer(data, mimeType)) return null;
+
+    return { data, mimeType };
+}
+
+function parseClanArray(value) {
+    return Array.isArray(value) ? value : [];
+}
+
+function formatClanDisplayName(displayName, clanName) {
+    const base = String(displayName || '').trim();
+    const clan = String(clanName || '').trim();
+    return clan ? `[${clan}] ${base}` : base;
+}
+
+async function getClanTagsForUsers(db, userIds) {
+    const ids = [...new Set((Array.isArray(userIds) ? userIds : [])
+        .map(value => Number.parseInt(value, 10))
+        .filter(Number.isInteger))];
+    if (!ids.length) return new Map();
+
+    const result = await db.query(`
+        SELECT
+            (member->>'userId')::integer AS user_id,
+            c.name AS clan_name
+        FROM clans c
+        CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.members, '[]'::jsonb)) AS member
+        WHERE (member->>'userId')::integer = ANY($1::integer[])
+    `, [ids]);
+
+    return new Map(result.rows.map(row => [Number(row.user_id), row.clan_name]));
+}
+
+async function getClanViewerMembership(db, userId) {
+    const id = Number.parseInt(userId, 10);
+    if (!Number.isInteger(id)) return null;
+
+    const result = await db.query(`
+        SELECT
+            c.id AS clan_id,
+            member->>'role' AS role
+        FROM clans c
+        CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.members, '[]'::jsonb)) AS member
+        WHERE (member->>'userId')::integer = $1
+        LIMIT 1
+    `, [id]);
+    return result.rows[0] || null;
+}
+
+async function deleteClanApplicationsForUser(db, userId, { excludeClanId = null } = {}) {
+    const id = Number.parseInt(userId, 10);
+    if (!Number.isInteger(id)) return;
+
+    const excludedId = Number.parseInt(excludeClanId, 10);
+    const hasExcludedClan = Number.isInteger(excludedId);
+    const values = hasExcludedClan ? [id, excludedId] : [id];
+    const excludedClanSql = hasExcludedClan ? 'AND c.id <> $2' : '';
+
+    await db.query(`
+        UPDATE clans c
+        SET applications = COALESCE((
+            SELECT jsonb_agg(entry)
+            FROM jsonb_array_elements(COALESCE(c.applications, '[]'::jsonb)) AS entry
+            WHERE (entry->>'userId')::integer <> $1
+        ), '[]'::jsonb)
+        WHERE EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements(COALESCE(c.applications, '[]'::jsonb)) AS application
+            WHERE (application->>'userId')::integer = $1
+        )
+        ${excludedClanSql}
+    `, values);
+}
+
+async function requireClanManager(db, clanId, userId, { ownerOnly = false } = {}) {
+    const result = await db.query(`
+        SELECT
+            c.id,
+            c.name,
+            c.owner_user_id,
+            c.members,
+            c.applications,
+            member->>'role' AS role,
+            COALESCE(NULLIF(actor.display_name, ''), actor.username, 'WBDL') AS actor_name
+        FROM clans c
+        LEFT JOIN users actor ON actor.id = $2
+        LEFT JOIN LATERAL (
+            SELECT value AS member
+            FROM jsonb_array_elements(COALESCE(c.members, '[]'::jsonb)) AS value
+            WHERE (value->>'userId')::integer = $2
+            LIMIT 1
+        ) membership ON TRUE
+        WHERE c.id = $1
+    `, [clanId, userId]);
+
+    const row = result.rows[0];
+    if (!row) return { error: 'Clan not found.', status: 404 };
+    const allowed = ownerOnly ? row.role === 'owner' : ['owner', 'manager'].includes(row.role);
+    if (!allowed) return { error: 'You do not have permission to manage this clan.', status: 403 };
+    return { clan: row };
+}
+
+function clanIconUrl(id, updatedAt) {
+    const version = updatedAt ? new Date(updatedAt).getTime() : Date.now();
+    return `/api/clans/${id}/icon?v=${Number.isFinite(version) ? version : Date.now()}`;
+}
+
+app.get('/api/clans', async (req, res) => {
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+
+    try {
+        const result = await pool.query(`
+            WITH player_points AS (
+                SELECT
+                    u.id AS user_id,
+                    SUM(
+                        CASE
+                            WHEN d.position > 150 THEN 0
+                            WHEN $1 = 'impossible' THEN
+                                (250 * EXP(-0.0263 * (d.position - 1))) * (r.percentage / 100.0)
+                            ELSE
+                                CASE
+                                    WHEN r.percentage = 100 THEN (250 * EXP(-0.0263 * (d.position - 1)))
+                                    WHEN d.position <= 75 AND r.percentage >= d.requirement THEN
+                                        (250 * EXP(-0.0263 * (d.position - 1))) / 10
+                                    ELSE 0
+                                END
+                        END
+                    ) AS total_points
+                FROM users u
+                JOIN records r ON r.user_id = u.id
+                JOIN demons d ON d.id = r.demon_id
+                WHERE r.status = 'accepted'
+                  AND r.list_type = $1
+                  AND d.list_type = $1
+                  AND COALESCE(u.leaderboard_banned, FALSE) = FALSE
+                GROUP BY u.id
+            ), clan_scores AS (
+                SELECT
+                    c.id,
+                    c.name,
+                    c.description,
+                    c.created_at,
+                    c.updated_at,
+                    jsonb_array_length(COALESCE(c.members, '[]'::jsonb))::int AS member_count,
+                    COALESCE(SUM(pp.total_points), 0) AS total_points
+                FROM clans c
+                LEFT JOIN LATERAL jsonb_array_elements(COALESCE(c.members, '[]'::jsonb)) AS member ON TRUE
+                LEFT JOIN player_points pp ON pp.user_id = (member->>'userId')::integer
+                GROUP BY c.id
+            ), ranked AS (
+                SELECT *, RANK() OVER (ORDER BY total_points DESC) AS rank
+                FROM clan_scores
+            )
+            SELECT *
+            FROM ranked
+            ORDER BY total_points DESC, created_at ASC, id ASC
+        `, [list]);
+
+        const membership = await getClanViewerMembership(pool, req.session?.userId);
+        res.json({
+            loggedIn: Boolean(req.session?.userId),
+            myClanId: membership ? Number(membership.clan_id) : null,
+            clans: result.rows.map(row => ({
+                id: Number(row.id),
+                name: row.name,
+                description: row.description || '',
+                memberCount: Number(row.member_count) || 0,
+                totalPoints: Number(row.total_points || 0).toFixed(2),
+                rank: Number(row.rank) || 0,
+                iconUrl: clanIconUrl(row.id, row.updated_at),
+            })),
+        });
+    } catch (err) {
+        console.error('Clan leaderboard error:', err);
+        res.status(500).json({ error: 'Could not load clans.' });
+    }
+});
+
+app.get('/api/clans/:clanId/icon', async (req, res) => {
+    const clanId = Number.parseInt(req.params.clanId, 10);
+    if (!Number.isInteger(clanId)) return res.sendStatus(404);
+
+    try {
+        const result = await pool.query(
+            'SELECT icon_data, icon_mime, updated_at FROM clans WHERE id = $1',
+            [clanId]
+        );
+        const clan = result.rows[0];
+        if (!clan?.icon_data) return res.sendStatus(404);
+
+        res.set('Content-Type', clan.icon_mime || 'image/webp');
+        res.set('Cache-Control', 'public, max-age=86400');
+        res.send(clan.icon_data);
+    } catch (err) {
+        console.error('Clan icon error:', err);
+        res.sendStatus(500);
+    }
+});
+
+app.get('/api/clans/:clanId', async (req, res) => {
+    const clanId = Number.parseInt(req.params.clanId, 10);
+    const list = req.currentList === 'impossible' ? 'impossible' : 'primary';
+    if (!Number.isInteger(clanId)) return res.status(400).json({ error: 'Invalid clan.' });
+
+    try {
+        const clanResult = await pool.query(`
+            WITH player_points AS (
+                SELECT
+                    u.id AS user_id,
+                    SUM(
+                        CASE
+                            WHEN d.position > 150 THEN 0
+                            WHEN $1 = 'impossible' THEN
+                                (250 * EXP(-0.0263 * (d.position - 1))) * (r.percentage / 100.0)
+                            ELSE
+                                CASE
+                                    WHEN r.percentage = 100 THEN (250 * EXP(-0.0263 * (d.position - 1)))
+                                    WHEN d.position <= 75 AND r.percentage >= d.requirement THEN
+                                        (250 * EXP(-0.0263 * (d.position - 1))) / 10
+                                    ELSE 0
+                                END
+                        END
+                    ) AS total_points
+                FROM users u
+                JOIN records r ON r.user_id = u.id
+                JOIN demons d ON d.id = r.demon_id
+                WHERE r.status = 'accepted'
+                  AND r.list_type = $1
+                  AND d.list_type = $1
+                  AND COALESCE(u.leaderboard_banned, FALSE) = FALSE
+                GROUP BY u.id
+            ), clan_scores AS (
+                SELECT
+                    c.id,
+                    c.name,
+                    c.description,
+                    c.owner_user_id,
+                    c.created_at,
+                    c.updated_at,
+                    c.members,
+                    c.applications,
+                    jsonb_array_length(COALESCE(c.members, '[]'::jsonb))::int AS member_count,
+                    COALESCE(SUM(pp.total_points), 0) AS total_points
+                FROM clans c
+                LEFT JOIN LATERAL jsonb_array_elements(COALESCE(c.members, '[]'::jsonb)) AS member ON TRUE
+                LEFT JOIN player_points pp ON pp.user_id = (member->>'userId')::integer
+                GROUP BY c.id
+            ), ranked AS (
+                SELECT *, RANK() OVER (ORDER BY total_points DESC) AS rank
+                FROM clan_scores
+            )
+            SELECT * FROM ranked WHERE id = $2
+        `, [list, clanId]);
+
+        const clan = clanResult.rows[0];
+        if (!clan) return res.status(404).json({ error: 'Clan not found.' });
+
+        const membersResult = await pool.query(`
+            WITH player_points AS (
+                SELECT
+                    u.id AS user_id,
+                    SUM(
+                        CASE
+                            WHEN d.position > 150 THEN 0
+                            WHEN $1 = 'impossible' THEN
+                                (250 * EXP(-0.0263 * (d.position - 1))) * (r.percentage / 100.0)
+                            ELSE
+                                CASE
+                                    WHEN r.percentage = 100 THEN (250 * EXP(-0.0263 * (d.position - 1)))
+                                    WHEN d.position <= 75 AND r.percentage >= d.requirement THEN
+                                        (250 * EXP(-0.0263 * (d.position - 1))) / 10
+                                    ELSE 0
+                                END
+                        END
+                    ) AS total_points
+                FROM users u
+                JOIN records r ON r.user_id = u.id
+                JOIN demons d ON d.id = r.demon_id
+                WHERE r.status = 'accepted'
+                  AND r.list_type = $1
+                  AND d.list_type = $1
+                  AND COALESCE(u.leaderboard_banned, FALSE) = FALSE
+                GROUP BY u.id
+            )
+            SELECT
+                u.id,
+                u.username,
+                u.display_name,
+                u.role AS site_role,
+                u.icon_type,
+                u.icon_id,
+                u.color1,
+                u.color2,
+                u.glow,
+                member->>'role' AS clan_role,
+                member->>'joinedAt' AS joined_at,
+                COALESCE(pp.total_points, 0) AS total_points
+            FROM clans c
+            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.members, '[]'::jsonb)) AS member
+            JOIN users u ON u.id = (member->>'userId')::integer
+            LEFT JOIN player_points pp ON pp.user_id = u.id
+            WHERE c.id = $2
+            ORDER BY
+                CASE member->>'role' WHEN 'owner' THEN 0 WHEN 'manager' THEN 1 ELSE 2 END,
+                COALESCE(pp.total_points, 0) DESC,
+                LOWER(u.username) ASC
+        `, [list, clanId]);
+
+        const viewerMembership = await getClanViewerMembership(pool, req.session?.userId);
+        const viewerRole = viewerMembership && Number(viewerMembership.clan_id) === clanId
+            ? viewerMembership.role
+            : null;
+        const canManage = ['owner', 'manager'].includes(viewerRole);
+
+        const storedApplications = parseClanArray(clan.applications);
+        const application = req.session?.userId
+            ? storedApplications.find(entry => Number(entry?.userId) === Number(req.session.userId) && entry?.status === 'pending') || null
+            : null;
+
+        let applications = [];
+        if (canManage) {
+            const pending = storedApplications.filter(entry => entry?.status === 'pending');
+            const pendingUserIds = [...new Set(pending.map(entry => Number(entry?.userId)).filter(Number.isInteger))];
+            let usersById = new Map();
+
+            if (pendingUserIds.length) {
+                const applicationUsersResult = await pool.query(`
+                    SELECT
+                        id,
+                        username,
+                        display_name,
+                        icon_type,
+                        icon_id,
+                        color1,
+                        color2,
+                        glow
+                    FROM users
+                    WHERE id = ANY($1::integer[])
+                `, [pendingUserIds]);
+                usersById = new Map(applicationUsersResult.rows.map(row => [Number(row.id), row]));
+            }
+
+            applications = pending
+                .map(entry => ({ entry, user: usersById.get(Number(entry.userId)) }))
+                .filter(item => item.user)
+                .map(({ entry, user }) => ({
+                    id: String(entry.id),
+                    created_at: entry.createdAt || null,
+                    user_id: Number(user.id),
+                    username: user.username,
+                    display_name: user.display_name,
+                    icon_type: user.icon_type,
+                    icon_id: user.icon_id,
+                    color1: user.color1,
+                    color2: user.color2,
+                    glow: user.glow,
+                }));
+        }
+
+        const serializeIcon = row => ({
+            type: row.icon_type || 'cube',
+            id: readProfileInt(row.icon_id, 1),
+            color1: readProfileInt(row.color1, 12),
+            color2: readProfileInt(row.color2, 3),
+            glow: readProfileInt(row.glow, -1),
+        });
+
+        res.json({
+            clan: {
+                id: Number(clan.id),
+                name: clan.name,
+                description: clan.description || '',
+                memberCount: Number(clan.member_count) || 0,
+                totalPoints: Number(clan.total_points || 0).toFixed(2),
+                rank: Number(clan.rank) || 0,
+                iconUrl: clanIconUrl(clan.id, clan.updated_at),
+            },
+            members: membersResult.rows.map(row => ({
+                id: Number(row.id),
+                username: row.username,
+                displayName: row.display_name || row.username,
+                siteRole: row.site_role || '',
+                clanRole: row.clan_role,
+                totalPoints: Number(row.total_points || 0).toFixed(2),
+                icon: serializeIcon(row),
+            })),
+            viewer: {
+                loggedIn: Boolean(req.session?.userId),
+                myClanId: viewerMembership ? Number(viewerMembership.clan_id) : null,
+                role: viewerRole,
+                canManage,
+                isOwner: viewerRole === 'owner',
+                canApply: Boolean(req.session?.userId)
+                    && !viewerMembership
+                    && Number(clan.member_count) < CLAN_MAX_MEMBERS
+                    && !application,
+                application: application ? { id: String(application.id), status: application.status } : null,
+            },
+            management: canManage ? {
+                applications: applications.map(row => ({
+                    id: String(row.id),
+                    userId: Number(row.user_id),
+                    username: row.username,
+                    displayName: row.display_name || row.username,
+                    icon: serializeIcon(row),
+                })),
+            } : null,
+        });
+    } catch (err) {
+        console.error('Clan detail error:', err);
+        res.status(500).json({ error: 'Could not load this clan.' });
+    }
+});
+
+app.post('/api/clans', async (req, res) => {
+    if (!req.session?.userId) return res.status(401).json({ error: 'You must be logged in.' });
+
+    const name = normalizeClanName(req.body?.name);
+    const description = normalizeClanDescription(req.body?.description);
+    const icon = parseClanIconDataUrl(req.body?.data);
+
+    if (!CLAN_NAME_PATTERN.test(name)) return res.status(400).json({ error: 'Clan names must be 1–4 letters or numbers.' });
+    if (!icon) return res.status(400).json({ error: 'Please upload a valid clan icon.' });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query('LOCK TABLE clans IN SHARE ROW EXCLUSIVE MODE');
+
+        const membership = await getClanViewerMembership(client, req.session.userId);
+        if (membership) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'You are already in a clan.' });
+        }
+
+        const joinedAt = new Date().toISOString();
+        const members = [{ userId: Number(req.session.userId), role: 'owner', joinedAt }];
+        const clanResult = await client.query(`
+            INSERT INTO clans (name, description, icon_data, icon_mime, owner_user_id, members, applications)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, '[]'::jsonb)
+            RETURNING id
+        `, [name, description, icon.data, icon.mimeType, req.session.userId, JSON.stringify(members)]);
+
+        await deleteClanApplicationsForUser(client, req.session.userId, {
+            excludeClanId: Number(clanResult.rows[0].id),
+        });
+
+        await client.query('COMMIT');
+        res.status(201).json({ message: 'Clan created!', clanId: Number(clanResult.rows[0].id) });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (err.code === '23505') {
+            return res.status(400).json({ error: 'That clan name is already taken, or you are already in a clan.' });
+        }
+        console.error('Clan creation error:', err);
+        res.status(500).json({ error: 'Could not create the clan.' });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/clans/:clanId', async (req, res) => {
+    if (!req.session?.userId) return res.status(401).json({ error: 'You must be logged in.' });
+    const clanId = Number.parseInt(req.params.clanId, 10);
+    if (!Number.isInteger(clanId)) return res.status(400).json({ error: 'Invalid clan.' });
+
+    try {
+        const permission = await requireClanManager(pool, clanId, req.session.userId);
+        if (permission.error) return res.status(permission.status).json({ error: permission.error });
+
+        const updates = [];
+        const values = [];
+        const add = (sql, value) => {
+            values.push(value);
+            updates.push(`${sql} = $${values.length}`);
+        };
+
+        if (req.body?.name !== undefined) {
+            const name = normalizeClanName(req.body.name);
+            if (!CLAN_NAME_PATTERN.test(name)) return res.status(400).json({ error: 'Clan names must be 1–4 letters or numbers.' });
+            add('name', name);
+        }
+        if (req.body?.description !== undefined) add('description', normalizeClanDescription(req.body.description));
+        if (req.body?.data !== undefined) {
+            const icon = parseClanIconDataUrl(req.body.data);
+            if (!icon) return res.status(400).json({ error: 'Please upload a valid clan icon.' });
+            add('icon_data', icon.data);
+            add('icon_mime', icon.mimeType);
+        }
+        if (!updates.length) return res.json({ message: 'Nothing changed.' });
+
+        values.push(clanId);
+        await pool.query(`
+            UPDATE clans
+            SET ${updates.join(', ')}
+            WHERE id = $${values.length}
+        `, values);
+        res.json({ message: 'Clan updated.' });
+    } catch (err) {
+        if (err.code === '23505') return res.status(400).json({ error: 'That clan name is already taken.' });
+        console.error('Clan update error:', err);
+        res.status(500).json({ error: 'Could not update the clan.' });
+    }
+});
+
+app.delete('/api/clans/:clanId', async (req, res) => {
+    if (!req.session?.userId) return res.status(401).json({ error: 'You must be logged in.' });
+    const clanId = Number.parseInt(req.params.clanId, 10);
+    if (!Number.isInteger(clanId)) return res.status(400).json({ error: 'Invalid clan.' });
+
+    try {
+        const permission = await requireClanManager(pool, clanId, req.session.userId, { ownerOnly: true });
+        if (permission.error) return res.status(permission.status).json({ error: permission.error });
+        await pool.query('DELETE FROM clans WHERE id = $1', [clanId]);
+        res.json({ message: 'Clan deleted.' });
+    } catch (err) {
+        console.error('Clan delete error:', err);
+        res.status(500).json({ error: 'Could not delete the clan.' });
+    }
+});
+
+app.post('/api/clans/:clanId/applications', async (req, res) => {
+    if (!req.session?.userId) return res.status(401).json({ error: 'You must be logged in.' });
+    const clanId = Number.parseInt(req.params.clanId, 10);
+    if (!Number.isInteger(clanId)) return res.status(400).json({ error: 'Invalid clan.' });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query('LOCK TABLE clans IN SHARE ROW EXCLUSIVE MODE');
+        const clanResult = await client.query(`
+            SELECT id, members, applications
+            FROM clans
+            WHERE id = $1
+            FOR UPDATE
+        `, [clanId]);
+        const clan = clanResult.rows[0];
+        if (!clan) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Clan not found.' });
+        }
+
+        const members = parseClanArray(clan.members);
+        if (members.length >= CLAN_MAX_MEMBERS) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'This clan is full.' });
+        }
+
+        const membership = await getClanViewerMembership(client, req.session.userId);
+        if (membership) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'You are already in a clan.' });
+        }
+
+        const applications = parseClanArray(clan.applications);
+        if (applications.some(entry => Number(entry?.userId) === Number(req.session.userId) && entry?.status === 'pending')) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'You already applied to this clan.' });
+        }
+
+        const applicationId = randomBytes(8).toString('hex');
+        applications.push({
+            id: applicationId,
+            userId: Number(req.session.userId),
+            status: 'pending',
+            createdAt: new Date().toISOString(),
+            respondedAt: null,
+            respondedByUserId: null,
+        });
+
+        await client.query('UPDATE clans SET applications = $2::jsonb WHERE id = $1', [clanId, JSON.stringify(applications)]);
+        await client.query('COMMIT');
+        res.status(201).json({ message: 'Application sent.', applicationId });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Clan application error:', err);
+        res.status(500).json({ error: 'Could not submit the application.' });
+    } finally {
+        client.release();
+    }
+});
+
+app.post('/api/clans/:clanId/applications/:applicationId/respond', async (req, res) => {
+    if (!req.session?.userId) return res.status(401).json({ error: 'You must be logged in.' });
+    const clanId = Number.parseInt(req.params.clanId, 10);
+    const applicationId = String(req.params.applicationId || '').trim();
+    const action = String(req.body?.action || '').toLowerCase();
+    if (!Number.isInteger(clanId) || !/^[A-Za-z0-9_-]{1,64}$/.test(applicationId) || !['accept', 'reject'].includes(action)) {
+        return res.status(400).json({ error: 'Invalid request.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query('LOCK TABLE clans IN SHARE ROW EXCLUSIVE MODE');
+        const permission = await requireClanManager(client, clanId, req.session.userId);
+        if (permission.error) {
+            await client.query('ROLLBACK');
+            return res.status(permission.status).json({ error: permission.error });
+        }
+
+        const clanResult = await client.query(`
+            SELECT id, name, members, applications
+            FROM clans
+            WHERE id = $1
+            FOR UPDATE
+        `, [clanId]);
+        const clan = clanResult.rows[0];
+        const members = parseClanArray(clan.members);
+        const applications = parseClanArray(clan.applications);
+        const application = applications.find(entry => String(entry?.id) === applicationId);
+
+        if (!application || application.status !== 'pending') {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Pending application not found.' });
+        }
+
+        const respondedAt = new Date().toISOString();
+        if (action === 'accept') {
+            if (members.length >= CLAN_MAX_MEMBERS) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ error: 'This clan is full.' });
+            }
+
+            const membership = await getClanViewerMembership(client, application.userId);
+            if (membership) {
+                application.status = 'rejected';
+                application.respondedAt = respondedAt;
+                application.respondedByUserId = Number(req.session.userId);
+                await client.query('UPDATE clans SET applications = $2::jsonb WHERE id = $1', [clanId, JSON.stringify(applications)]);
+                await client.query('COMMIT');
+                return res.status(400).json({ error: 'That user already joined another clan.' });
+            }
+
+            members.push({
+                userId: Number(application.userId),
+                role: 'member',
+                joinedAt: respondedAt,
+            });
+            application.status = 'accepted';
+            application.respondedAt = respondedAt;
+            application.respondedByUserId = Number(req.session.userId);
+
+            await client.query(`
+                UPDATE clans
+                SET members = $2::jsonb,
+                    applications = $3::jsonb
+                WHERE id = $1
+            `, [clanId, JSON.stringify(members), JSON.stringify(applications)]);
+
+            await deleteClanApplicationsForUser(client, application.userId, {
+                excludeClanId: clanId,
+            });
+
+            await createInboxNotification(client, {
+                userId: application.userId,
+                actorId: req.session.userId,
+                type: 'message',
+                subject: `Clan application accepted: [${clan.name}]`,
+                body: `Your application to join **[${clan.name}]** was accepted. Welcome to the clan!`,
+                senderName: permission.clan.actor_name,
+            });
+        } else {
+            application.status = 'rejected';
+            application.respondedAt = respondedAt;
+            application.respondedByUserId = Number(req.session.userId);
+            await client.query('UPDATE clans SET applications = $2::jsonb WHERE id = $1', [clanId, JSON.stringify(applications)]);
+            await createInboxNotification(client, {
+                userId: application.userId,
+                actorId: req.session.userId,
+                type: 'message',
+                subject: `Clan application rejected: [${clan.name}]`,
+                body: `Your application to join **[${clan.name}]** was rejected.`,
+                senderName: permission.clan.actor_name,
+            });
+        }
+
+        await client.query('COMMIT');
+        res.json({ message: action === 'accept' ? 'Application accepted.' : 'Application rejected.' });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Clan application response error:', err);
+        res.status(500).json({ error: 'Could not process the application.' });
+    } finally {
+        client.release();
+    }
+});
+
+app.patch('/api/clans/:clanId/members/:userId/role', async (req, res) => {
+    if (!req.session?.userId) return res.status(401).json({ error: 'You must be logged in.' });
+    const clanId = Number.parseInt(req.params.clanId, 10);
+    const userId = Number.parseInt(req.params.userId, 10);
+    const role = String(req.body?.role || '').toLowerCase();
+    if (!Number.isInteger(clanId) || !Number.isInteger(userId) || !['manager', 'member'].includes(role)) {
+        return res.status(400).json({ error: 'Invalid request.' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const permission = await requireClanManager(client, clanId, req.session.userId);
+        if (permission.error) {
+            await client.query('ROLLBACK');
+            return res.status(permission.status).json({ error: permission.error });
+        }
+
+        const clanResult = await client.query('SELECT name, members FROM clans WHERE id = $1 FOR UPDATE', [clanId]);
+        const clan = clanResult.rows[0];
+        const members = parseClanArray(clan.members);
+        const target = members.find(member => Number(member?.userId) === userId);
+        if (!target || target.role === 'owner') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'That member cannot be changed.' });
+        }
+
+        if (role === 'manager') {
+            for (const member of members) {
+                if (member.role === 'manager') member.role = 'member';
+            }
+        }
+        target.role = role;
+
+        await client.query('UPDATE clans SET members = $2::jsonb WHERE id = $1', [clanId, JSON.stringify(members)]);
+        await createInboxNotification(client, {
+            userId,
+            actorId: req.session.userId,
+            type: 'message',
+            subject: role === 'manager' ? `You are now the manager of [${clan.name}]` : `You are no longer the manager of [${clan.name}]`,
+            body: role === 'manager'
+                ? `You were made the manager of **[${clan.name}]**.`
+                : `Your manager role in **[${clan.name}]** was removed.`,
+            senderName: permission.clan.actor_name,
+        });
+        await client.query('COMMIT');
+        res.json({ message: role === 'manager' ? 'Manager assigned.' : 'Manager removed.' });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Clan role error:', err);
+        res.status(500).json({ error: 'Could not change the clan role.' });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/clans/:clanId/members/:userId', async (req, res) => {
+    if (!req.session?.userId) return res.status(401).json({ error: 'You must be logged in.' });
+    const clanId = Number.parseInt(req.params.clanId, 10);
+    const userId = Number.parseInt(req.params.userId, 10);
+    if (!Number.isInteger(clanId) || !Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid request.' });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const permission = await requireClanManager(client, clanId, req.session.userId);
+        if (permission.error) {
+            await client.query('ROLLBACK');
+            return res.status(permission.status).json({ error: permission.error });
+        }
+
+        const clanResult = await client.query('SELECT name, members FROM clans WHERE id = $1 FOR UPDATE', [clanId]);
+        const clan = clanResult.rows[0];
+        const members = parseClanArray(clan.members);
+        const target = members.find(member => Number(member?.userId) === userId);
+        if (!target) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Member not found.' });
+        }
+        if (target.role === 'owner') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'The clan owner cannot be removed.' });
+        }
+        if (permission.clan.role === 'manager' && target.role !== 'member') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({ error: 'Managers can only remove regular members.' });
+        }
+
+        const userResult = await client.query('SELECT username FROM users WHERE id = $1', [userId]);
+        const username = userResult.rows[0]?.username || 'User';
+        const updatedMembers = members.filter(member => Number(member?.userId) !== userId);
+        await client.query('UPDATE clans SET members = $2::jsonb WHERE id = $1', [clanId, JSON.stringify(updatedMembers)]);
+        await createInboxNotification(client, {
+            userId,
+            actorId: req.session.userId,
+            type: 'message',
+            subject: `Removed from [${clan.name}]`,
+            body: `You were removed from **[${clan.name}]**.`,
+            senderName: `[${clan.name}]`,
+        });
+        await client.query('COMMIT');
+        res.json({ message: `${username} was removed.` });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Clan member removal error:', err);
+        res.status(500).json({ error: 'Could not remove the member.' });
+    } finally {
+        client.release();
+    }
+});
+
+app.post('/api/clans/:clanId/leave', async (req, res) => {
+    if (!req.session?.userId) return res.status(401).json({ error: 'You must be logged in.' });
+    const clanId = Number.parseInt(req.params.clanId, 10);
+    if (!Number.isInteger(clanId)) return res.status(400).json({ error: 'Invalid clan.' });
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const clanResult = await client.query('SELECT members FROM clans WHERE id = $1 FOR UPDATE', [clanId]);
+        const clan = clanResult.rows[0];
+        if (!clan) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Clan not found.' });
+        }
+
+        const members = parseClanArray(clan.members);
+        const membership = members.find(member => Number(member?.userId) === Number(req.session.userId));
+        if (!membership) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'You are not in this clan.' });
+        }
+        if (membership.role === 'owner') {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'The owner must delete the clan instead.' });
+        }
+
+        const updatedMembers = members.filter(member => Number(member?.userId) !== Number(req.session.userId));
+        await client.query('UPDATE clans SET members = $2::jsonb WHERE id = $1', [clanId, JSON.stringify(updatedMembers)]);
+        await client.query('COMMIT');
+        res.json({ message: 'You left the clan.' });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error('Clan leave error:', err);
+        res.status(500).json({ error: 'Could not leave the clan.' });
+    } finally {
+        client.release();
+    }
+});
+
+
+app.post('/api/forgot-password', async (req, res) => {
+    const { email, captchaToken } = req.body;
+
+    if (!captchaToken) {
+        return res.status(400).json({ error: "bro is a bot" });
+    }
+
+    const SECRET_KEY = process.env.RECAPTCHA_SECRET;
+
+    try {
+        const params = new URLSearchParams();
+        params.append('secret', SECRET_KEY);
+        params.append('response', captchaToken);
+
+        const googleRes = await axios.post(
+            'https://www.google.com/recaptcha/api/siteverify',
+            params
+        );
+
+        if (!googleRes.data.success) {
+            return res.status(400).json({ error: "bro is a bot" });
+        }
+    } catch (err) {
+        console.error("Captcha Error:", err);
+        return res.status(500).json({ error: "Error verifying CAPTCHA." });
+    }
+
+    try {
+        const user = await pool.query('SELECT id, username FROM users WHERE email = $1', [email]);
+        if (user.rows.length === 0) {
+            return res.json({ message: "Reset link sent!" }); // Not really, the account doesnt exist LMAO
+        }
+
+        const token = randomBytes(32).toString('hex');
+        const expires = new Date(Date.now() + 3600000);
+
+        await pool.query(
+            'UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE email = $3',
+            [token, expires, email]
+        );
+
+        const link = `https://webdemonlist.org/reset-password?token=${token}`;
+        await sendResetEmail(email, user.rows[0].username, link);
+
+        res.json({ message: "Reset link sent!" });
+    } catch (err) {
+        res.status(500).json({ error: "Error processing request" });
+    }
+});
+
+app.post('/api/reset-password', async (req, res) => {
+    const { token, newPassword } = req.body;
+    try {
+        const user = await pool.query(
+            'SELECT id FROM users WHERE reset_token = $1 AND reset_token_expires > NOW()',
+            [token]
+        );
+
+        if (user.rows.length === 0) return res.status(400).json({ error: "Invalid or expired token." });
+
+        const hashedPw = await bcrypt.hash(newPassword, 10);
+        await pool.query(
+            'UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2',
+            [hashedPw, user.rows[0].id]
+        );
+
+        res.json({ message: "Password updated successfully!" });
+    } catch (err) {
+        res.status(500).json({ error: "Error resetting password" });
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, async () => {
+    console.log(`Scratch Demon List server live on port ${PORT}`);
+    if (!databaseUrl) {
+        console.error('DATABASE_URL is missing. The site can serve static pages, but login/admin/data features require PostgreSQL.');
+        return;
+    }
+    try {
+        await pool.query('SELECT 1');
+        console.log('Database connection OK.');
+        await ensureConfiguredOwner();
+    } catch (err) {
+        console.error('Database startup check failed:', err.message);
+    }
+});

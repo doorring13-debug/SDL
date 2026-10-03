@@ -1,0 +1,12 @@
+{
+    "crons": [
+        {
+            "path": "/api/discord/sync",
+            "schedule": "0 0 * * *"
+        },
+        {
+            "path": "/api/leaderboard/top1-check",
+            "schedule": "0 0 * * *"
+        }
+    ]
+}
