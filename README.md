@@ -21,13 +21,7 @@ The application uses PostgreSQL for users, levels, records, submissions, and mod
 
 Create `.env` with at least:
 
-```env
-DATABASE_URL=YOUR_POSTGRES_CONNECTION_STRING
-OWNER_USERNAME=zeroGD
-OWNER_PASSWORD=rightpeice5u!
-OWNER_EMAIL=zeroGD@local.invalid
-SESSION_SECRET=CHANGE_THIS_TO_A_LONG_RANDOM_SECRET
-```
+
 
 `DATABASE_URL` is required for login, the admin panel, and database-backed site features.
 
